@@ -543,7 +543,7 @@ class TestSquidConfigValidation(TestCase):
         assert config.count("acl CONNECT method CONNECT") == 1
         assert (
             "http_access allow src__ab12cd34__stg-terrasquid-ps7-client "
-            "CONNECT rule_dst__ab12cd34__stg-terrasquid-ps7-client-terraform__1 port__443"
+            "CONNECT dst__ab12cd34__stg-terrasquid-ps7-client-terraform port__443"
         ) in config
         assert "dstport__" not in config
 
@@ -580,13 +580,26 @@ class TestSquidConfigValidation(TestCase):
         rule.sources.add(source)
         rule.destinations.add(destination)
         rule.destination_groups.add(group)
+        second_rule = ACLRule.objects.create(
+            service="consumer-service",
+            name="allow-common-sites-again",
+            key_prefix="ab12cd34",
+        )
+        second_rule.sources.add(source)
+        second_rule.destination_groups.add(group)
 
         config = render_squid_config()
 
         assert (
-            config.count("http_access allow src__ab12cd34__local-source CONNECT rule_dst__ab12cd34__allow-common-sites")
-            == 1
+            config.splitlines().count(
+                "http_access allow src__ab12cd34__local-source CONNECT "
+                "dst_group__dc34ab12__common-sites-cloud-access__1 port__443"
+            )
+            == 2
         )
+        assert config.count("acl dst_group__dc34ab12__common-sites-cloud-access__1 any-of") == 1
+        assert "acl rule_dst__ab12cd34__allow-common-sites__1" not in config
+        assert "acl rule_dst__ab12cd34__allow-common-sites-again__1" not in config
 
     def test_render_partitions_destination_groups_by_access_policy(self) -> None:
         """Only compatible destinations share a Squid ACL and access rule."""
@@ -651,16 +664,22 @@ class TestSquidConfigValidation(TestCase):
 
         config = render_squid_config()
 
-        assert "dstdomain github.com google.com" in config
-        assert "dstdomain ssh.example.com" in config
-        assert "dstdomain blocked.example.com" in config
-        assert "dst 192.0.2.0/24" in config
-        assert config.count("acl rule_dst__ab12cd34__allow-common-sites__") == 4
+        assert ("any-of dst__dc34ab12__github dst__dc34ab12__google dst__dc34ab12__network") in config
+        assert "any-of dst__dc34ab12__ssh" in config
+        assert "any-of dst__dc34ab12__blocked" in config
+        assert "acl rule_dst__ab12cd34__allow-common-sites__" not in config
         assert (
-            config.count("http_access allow src__ab12cd34__local-source CONNECT rule_dst__ab12cd34__allow-common-sites")
-            == 3
+            config.count(
+                "http_access allow src__ab12cd34__local-source CONNECT dst_group__dc34ab12__common-sites-cloud-access__"
+            )
+            == 2
         )
-        assert config.count("http_access deny src__ab12cd34__local-source rule_dst__ab12cd34__allow-common-sites") == 1
+        assert (
+            config.count(
+                "http_access deny src__ab12cd34__local-source dst_group__dc34ab12__common-sites-cloud-access__"
+            )
+            == 1
+        )
 
     def test_render_declares_all_rule_acls_before_access_rules(self) -> None:
         """Declare every generated rule ACL before source access statements can use it."""
@@ -689,6 +708,15 @@ class TestSquidConfigValidation(TestCase):
             )
             rule.sources.add(source)
             rule.destinations.add(destination)
+            rule.destinations.add(
+                DestinationConfig.objects.create(
+                    service="test-service",
+                    name=f"second-destination-{index}",
+                    key_prefix="ab12cd34",
+                    dst=f"second-destination-{index}.example.com",
+                    type="ALLOW",
+                )
+            )
 
         config = render_squid_config()
         rule_acl_positions = [config.index(f"acl rule_dst__ab12cd34__rule-{index}__1") for index in range(2)]
@@ -722,9 +750,8 @@ class TestSquidConfigValidation(TestCase):
 
         config = render_squid_config()
 
-        assert config.index("http_access allow src__ab12cd34__a-source") < config.index(
-            "http_access allow src__ab12cd34__z-source"
-        )
+        assert ("acl rule_src__ab12cd34__rule any-of src__ab12cd34__a-source src__ab12cd34__z-source") in config
+        assert config.count("http_access allow rule_src__ab12cd34__rule") == 1
 
     def test_render_orders_rules_by_priority_type_then_creation_time(self) -> None:
         """Order access rules by ascending priority, action type, then creation time."""
@@ -764,7 +791,7 @@ class TestSquidConfigValidation(TestCase):
         config = render_squid_config()
         access_lines = [line for line in config.splitlines() if line.startswith("http_access ") and "src__" in line]
 
-        assert [line.split("rule_dst__ab12cd34__", 1)[1].split("__1", 1)[0] for line in access_lines] == [
+        assert [line.split(" dst__ab12cd34__", 1)[1].split(" port__", 1)[0] for line in access_lines] == [
             "priority-99-allow",
             "priority-100-deny",
             "priority-100-connect",
@@ -773,7 +800,7 @@ class TestSquidConfigValidation(TestCase):
         ]
         connect_lines = [line for line in access_lines if " CONNECT " in line]
         assert len(connect_lines) == 1
-        assert "rule_dst__ab12cd34__priority-100-connect__1" in connect_lines[0]
+        assert "dst__ab12cd34__priority-100-connect" in connect_lines[0]
 
     def test_render_places_comments_before_their_acl_blocks(self) -> None:
         """Configured comments label their source, destination, and logical rule exactly once."""
