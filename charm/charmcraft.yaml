@@ -44,11 +44,13 @@ config:
       type: int
       default: 0
       description: |
-        Pin the applied Squid configuration to a specific version number.
-        When set to 0 (the default), the watcher always applies the latest
-        rendered configuration. When set to a positive integer N, the watcher
-        will only apply the configuration rendered at version N. If that version
-        has not been rendered yet, the watcher will skip the update until it is.
+        Pin every unit to the full rendered Squid configuration retained for a
+        specific version number. Pinning does not rewind API resources or stop
+        new database versions from being created. Set to 0 (the default) to
+        apply the latest rendered configuration. If a positive version has not
+        been retained, the watcher skips updates until it is available. History
+        retains every revision from the trailing 24 hours and one revision per
+        older UTC day.
     external-hostname:
       type: string
       default: ""

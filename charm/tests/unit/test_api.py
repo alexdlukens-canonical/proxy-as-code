@@ -1,6 +1,7 @@
 """Unit tests for the Terrasquid Django REST API."""
 
 import uuid
+from datetime import UTC, datetime, timedelta
 from unittest.mock import patch
 
 from django.test import TestCase, override_settings
@@ -865,6 +866,55 @@ class TestConfigVersionHistory(TestCase):
         ConfigVersion.increment("# config v2")
         assert RenderedConfigHistory.objects.count() == 2
         assert RenderedConfigHistory.objects.get(version=2).rendered_config == "# config v2"
+
+    @override_settings(SQUID_PINNED_CONFIG_VERSION=7)
+    def test_increment_prunes_history_without_removing_active_pin(self) -> None:
+        """Each new version must enforce retention while protecting the active pin."""
+        from terrasquid.api.models import ConfigVersion, RenderedConfigHistory
+
+        with patch.object(RenderedConfigHistory, "prune") as prune:
+            ConfigVersion.increment("# config v1")
+
+        prune.assert_called_once_with(pinned_version=7)
+
+    def test_prune_keeps_recent_versions_and_latest_per_older_utc_day(self) -> None:
+        """Retention keeps all trailing-day entries and one latest entry per older day."""
+        from terrasquid.api.models import RenderedConfigHistory
+
+        now = datetime(2026, 9, 18, 12, tzinfo=UTC)
+        entries = [
+            RenderedConfigHistory.objects.create(version=version, rendered_config=f"# config v{version}")
+            for version in range(1, 7)
+        ]
+        timestamps = [
+            now - timedelta(hours=2),
+            now - timedelta(hours=23),
+            datetime(2026, 9, 16, 20, tzinfo=UTC),
+            datetime(2026, 9, 16, 8, tzinfo=UTC),
+            datetime(2026, 9, 15, 20, tzinfo=UTC),
+            datetime(2026, 9, 15, 8, tzinfo=UTC),
+        ]
+        for entry, created_at in zip(entries, timestamps, strict=True):
+            RenderedConfigHistory.objects.filter(pk=entry.pk).update(created_at=created_at)
+
+        deleted = RenderedConfigHistory.prune(now=now)
+
+        assert deleted == 2
+        assert set(RenderedConfigHistory.objects.values_list("version", flat=True)) == {1, 2, 3, 5}
+
+    def test_prune_uses_pinned_version_as_older_day_representative(self) -> None:
+        """Retention must not remove the currently pinned historical config."""
+        from terrasquid.api.models import RenderedConfigHistory
+
+        now = datetime(2026, 9, 18, 12, tzinfo=UTC)
+        latest = RenderedConfigHistory.objects.create(version=1, rendered_config="# latest that day")
+        pinned = RenderedConfigHistory.objects.create(version=2, rendered_config="# pinned")
+        RenderedConfigHistory.objects.filter(pk=latest.pk).update(created_at=datetime(2026, 9, 16, 20, tzinfo=UTC))
+        RenderedConfigHistory.objects.filter(pk=pinned.pk).update(created_at=datetime(2026, 9, 16, 8, tzinfo=UTC))
+
+        RenderedConfigHistory.prune(now=now, pinned_version=pinned.version)
+
+        assert set(RenderedConfigHistory.objects.values_list("version", flat=True)) == {2}
 
 
 class TestRenderSquidConfigPinning(TestCase):

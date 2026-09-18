@@ -14,6 +14,34 @@ To test the workflow locally with act, run
 from the repository root. If act reports an unsupported platform, add
 `-P ubuntu-24.04=catthehacker/ubuntu:act-24.04` to the command or to your act
 configuration file. This runs the job but does not verify GitHub's PR path filter.
+## Roll back the applied Squid configuration
+
+Terrasquid retains every complete rendered Squid configuration from the trailing
+24 hours. For older history, it retains the latest revision from each UTC day.
+If an older revision is pinned, that revision becomes the retained revision for
+its day. In Django admin, open **Rendered config histories** and select a version
+to inspect the exact configuration that was generated.
+
+To apply a retained version across every unit, set the application-wide pin:
+
+```shell
+juju config <application> squid-pinned-config-version=<version>
+```
+
+Pinning changes the configuration applied to Squid. It does not rewind sources,
+destinations, or ACL rules managed through the API or Terraform. Those resources
+remain at their latest state, and writes continue to create new database config
+versions.
+
+Check `/api/v1/status/` on each unit after the watcher runs. While pinned,
+`applied_config_version` should equal the selected version and may differ from
+`db_config_version`.
+
+To resume the latest rendered configuration, clear the pin:
+
+```shell
+juju config <application> squid-pinned-config-version=0
+```
 
 ## Grafana Dashboards
 
