@@ -75,7 +75,8 @@ State is stored in a PostgreSQL database via the `database` Juju relation. The c
 | `squid-port` | int | `3128` | Squid HTTP proxy listen port |
 | `api-port` | int | `8000` | Gunicorn listen port |
 | `gunicorn-workers` | int | `4` | Gunicorn worker process count |
-| `squid-extra-config` | string | `""` | Verbatim Squid config snippet appended before the final `http_access deny all` line |
+| `squid-prepend-config` | string | `""` | Raw Squid configuration inserted before generated source ACLs |
+| `squid-append-config` | string | `""` | Raw Squid configuration inserted after generated ACL rules and before the default deny |
 
 ## Authentication
 
@@ -203,6 +204,8 @@ acl terrasquid_connect_method method CONNECT
 # Port groups  (name format: <service>__<user-name>)
 acl ps7_myservice__web_ports port 80 443
 
+# <squid-prepend-config charm config value is inserted here>
+
 # Source ACLs  (name format: <service>__<user-name>)
 acl ps7_myservice__instance_net src 10.20.0.0/16
 
@@ -216,7 +219,7 @@ http_access deny  CONNECT !<dest_port_acl>                              # block 
 http_access allow <source> terrasquid_connect_method <dest>             # priority 100, CONNECT
 http_access allow <source> <dest>                                       # priority 100, ALLOW
 
-# <squid-extra-config charm config value is inserted here>
+# <squid-append-config charm config value is inserted here>
 
 # Default deny — must remain last
 http_access deny all
@@ -257,8 +260,6 @@ Example 422 response body:
 ```
 
 Delete operations do not require validation (removing a rule can only make the config smaller and cannot introduce syntax errors), but they do hold the advisory lock to prevent racing with a concurrent create/update.
-
-**`squid-extra-config` validation**: Changes to the `squid-extra-config` charm config option trigger the same `squid -k parse` dry-run on the leader unit before the new value is written to application config storage. If validation fails, the charm hook exits with an error and sets the unit to `blocked`, preventing the bad snippet from being applied.
 
 ### **Config Reload Flow**
 

@@ -38,7 +38,6 @@ def base_state():
             "squid-watcher-interval": 30,
             "api-port": 8080,
             "gunicorn-workers": 4,
-            "squid-extra-config": "",
         }
     )
 
@@ -286,7 +285,6 @@ class TestEnvFile:
                 "squid-port": 3128,
                 "api-port": 8080,
                 "gunicorn-workers": 4,
-                "squid-extra-config": "",
                 "squid-pinned-config-version": 5,
             }
         )
