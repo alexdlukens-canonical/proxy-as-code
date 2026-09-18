@@ -28,10 +28,6 @@ config:
       type: int
       default: 4
       description: Number of Gunicorn worker processes.
-    squid-extra-config:
-      type: string
-      default: ""
-      description: Extra Squid configuration lines appended to the generated config.
     squid-prepend-config:
       type: string
       default: ""
