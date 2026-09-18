@@ -2,8 +2,11 @@
 
 import ipaddress
 import uuid
+from datetime import UTC, datetime, timedelta
 
+from django.conf import settings
 from django.db import models
+from django.utils import timezone
 
 NAME_PATTERN = r"^[a-zA-Z0-9_-]+$"
 SERVICE_PATTERN = r"^[a-zA-Z0-9_-]+$"
@@ -178,13 +181,15 @@ class ConfigVersion(models.Model):
             version=obj.version,
             defaults={"rendered_config": rendered_config},
         )
+        RenderedConfigHistory.prune(pinned_version=settings.SQUID_PINNED_CONFIG_VERSION)
         return obj
 
 
 class RenderedConfigHistory(models.Model):
-    """Stores the rendered Squid configuration for each version, enabling pinning.
+    """Stores retained rendered Squid configurations, enabling pinning.
 
-    **Design**: A separate history table storing immutable records of every rendered config.
+    **Design**: Store every config from the trailing 24 hours and one config per
+    older UTC day.
 
     **Use case**: The squid-pinned-config-version charm config option allows operators to
     "freeze" at a specific version. When pinned, the watcher reads the config from this
@@ -193,14 +198,14 @@ class RenderedConfigHistory(models.Model):
     **Relationship to ConfigVersion**:
     - ConfigVersion.increment() automatically creates a new RenderedConfigHistory entry.
     - This model stores the history; ConfigVersion stores the current pointer.
-    - Never update or delete RenderedConfigHistory entries (immutable audit trail).
+    - Retained entries are immutable; retention cleanup only deletes superseded entries.
 
     See ConfigVersion for the current state; this model for historical records.
     """
 
     version = models.IntegerField(unique=True)
     rendered_config = models.TextField()
-    created_at = models.DateTimeField(auto_now_add=True)
+    created_at = models.DateTimeField(auto_now_add=True, db_index=True)
 
     class Meta:
         ordering = ["-version"]
@@ -208,3 +213,24 @@ class RenderedConfigHistory(models.Model):
     def __str__(self) -> str:
         """Return the string representation."""
         return f"v{self.version}"
+
+    @classmethod
+    def prune(cls, *, pinned_version: int = 0, now: datetime | None = None) -> int:
+        """Delete superseded entries outside the trailing 24-hour window."""
+        cutoff = (now or timezone.now()) - timedelta(hours=24)
+        old_entries = list(
+            cls.objects.filter(created_at__lt=cutoff)
+            .only("pk", "version", "created_at")
+            .order_by("-created_at", "-version")
+        )
+        retained_by_day = {}
+
+        for entry in old_entries:
+            day = entry.created_at.astimezone(UTC).date()
+            retained_by_day.setdefault(day, entry.pk)
+            if entry.version == pinned_version:
+                retained_by_day[day] = entry.pk
+
+        retained_ids = tuple(retained_by_day.values())
+        deleted, _ = cls.objects.filter(created_at__lt=cutoff).exclude(pk__in=retained_ids).delete()
+        return deleted
