@@ -1,5 +1,20 @@
 # Terrasquid Charm
 
+## Unit tests
+
+With Python 3.12 available, install `tox` and `tox-uv`, then run `tox -e unit`
+from the `charm/` directory. GitHub Actions runs the same unit suite on pull
+requests that change files under `charm/`.
+
+Charm libraries under `charm/lib/` are vendored dependencies and must be committed
+so the tests work from a clean checkout.
+
+To test the workflow locally with act, run
+`act pull_request -W .github/workflows/charm-unit-tests.yaml -j unit-tests`
+from the repository root. If act reports an unsupported platform, add
+`-P ubuntu-24.04=catthehacker/ubuntu:act-24.04` to the command or to your act
+configuration file. This runs the job but does not verify GitHub's PR path filter.
+
 ## Grafana Dashboards
 
 The charm publishes the `Terrasquid Overview` and `Squid Metrics` dashboards through its `cos-agent` relation.
