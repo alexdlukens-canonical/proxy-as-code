@@ -1,5 +1,30 @@
 # Terrasquid Charm
 
+## Persistent credentials
+
+The Django `SECRET_KEY` is stored in the application-owned Juju secret labelled
+`terrasquid-django`. All units use the same key, and replacement units retrieve it
+from Juju rather than generating a new one. This requires Juju 3 or later.
+
+On upgrade from a revision with a local `/var/lib/terrasquid/secret_key`, the leader
+copies its existing key unchanged into the Juju secret before removing the local
+file. If storing the secret fails, the file is retained and the hook fails for
+retry. An existing Juju secret is never overwritten by a unit's local key.
+Followers wait for the shared key before configuring the workload. Previously,
+each unit had its own key; adopting the leader's key can invalidate sessions
+signed by another unit's old key.
+
+Database credentials remain managed by the PostgreSQL relation. TLS private keys
+are already stored in Juju secrets by the certificates library and can be
+reissued for replacement units. API keys and superuser passwords are stored as
+hashes in PostgreSQL, not recoverable plaintext secrets; retain the original API
+key or rotate it if lost. Protect and back up both the Juju controller's secret
+storage and PostgreSQL: application secrets survive unit replacement, not
+application removal or loss of the controller's secret store.
+
+The workload still needs a local environment file containing the Django key and
+database URL. The charm creates it with restricted permissions (0640).
+
 ## Unit tests
 
 With Python 3.12 available, install `tox` and `tox-uv`, then run `tox -e unit`
