@@ -53,6 +53,7 @@ class Command(BaseCommand):
             return
 
         pinned_version = settings.SQUID_PINNED_CONFIG_VERSION
+        RenderedConfigHistory.prune(pinned_version=pinned_version)
         if pinned_version > 0:
             try:
                 history_entry = RenderedConfigHistory.objects.get(version=pinned_version)

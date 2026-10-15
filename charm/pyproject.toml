@@ -32,6 +32,7 @@ dependencies = [
 [project.optional-dependencies]
 dev = [
     "pytest>=9.0.3",
+    "pytest-cov>=7.0.0",
     "pytest-django>=4.12.0",
     "ruff>=0.15.12",
     "pyright>=1.1.409",
@@ -68,9 +69,19 @@ python_classes = ["Test*"]
 python_functions = ["test_*"]
 addopts = "--tb=short"
 
+[tool.coverage.run]
+branch = true
+source = ["src"]
+relative_files = true
+
+[tool.coverage.report]
+show_missing = true
+include_namespace_packages = true
+
 [dependency-groups]
 dev = [
     "ops[testing]>=3.7.0",
     "pytest>=9.0.3",
+    "pytest-cov>=7.0.0",
     "ruff>=0.15.12",
 ]

@@ -1,6 +1,7 @@
 """Unit tests for the Terrasquid Django REST API."""
 
 import uuid
+from datetime import UTC, datetime, timedelta
 from unittest.mock import patch
 
 from django.test import TestCase, override_settings
@@ -542,7 +543,7 @@ class TestSquidConfigValidation(TestCase):
         assert config.count("acl CONNECT method CONNECT") == 1
         assert (
             "http_access allow src__ab12cd34__stg-terrasquid-ps7-client "
-            "CONNECT rule_dst__ab12cd34__stg-terrasquid-ps7-client-terraform__1 port__443"
+            "CONNECT dst__ab12cd34__stg-terrasquid-ps7-client-terraform port__443"
         ) in config
         assert "dstport__" not in config
 
@@ -579,13 +580,26 @@ class TestSquidConfigValidation(TestCase):
         rule.sources.add(source)
         rule.destinations.add(destination)
         rule.destination_groups.add(group)
+        second_rule = ACLRule.objects.create(
+            service="consumer-service",
+            name="allow-common-sites-again",
+            key_prefix="ab12cd34",
+        )
+        second_rule.sources.add(source)
+        second_rule.destination_groups.add(group)
 
         config = render_squid_config()
 
         assert (
-            config.count("http_access allow src__ab12cd34__local-source CONNECT rule_dst__ab12cd34__allow-common-sites")
-            == 1
+            config.splitlines().count(
+                "http_access allow src__ab12cd34__local-source CONNECT "
+                "dst_group__dc34ab12__common-sites-cloud-access__1 port__443"
+            )
+            == 2
         )
+        assert config.count("acl dst_group__dc34ab12__common-sites-cloud-access__1 any-of") == 1
+        assert "acl rule_dst__ab12cd34__allow-common-sites__1" not in config
+        assert "acl rule_dst__ab12cd34__allow-common-sites-again__1" not in config
 
     def test_render_partitions_destination_groups_by_access_policy(self) -> None:
         """Only compatible destinations share a Squid ACL and access rule."""
@@ -650,16 +664,22 @@ class TestSquidConfigValidation(TestCase):
 
         config = render_squid_config()
 
-        assert "dstdomain github.com google.com" in config
-        assert "dstdomain ssh.example.com" in config
-        assert "dstdomain blocked.example.com" in config
-        assert "dst 192.0.2.0/24" in config
-        assert config.count("acl rule_dst__ab12cd34__allow-common-sites__") == 4
+        assert ("any-of dst__dc34ab12__github dst__dc34ab12__google dst__dc34ab12__network") in config
+        assert "any-of dst__dc34ab12__ssh" in config
+        assert "any-of dst__dc34ab12__blocked" in config
+        assert "acl rule_dst__ab12cd34__allow-common-sites__" not in config
         assert (
-            config.count("http_access allow src__ab12cd34__local-source CONNECT rule_dst__ab12cd34__allow-common-sites")
-            == 3
+            config.count(
+                "http_access allow src__ab12cd34__local-source CONNECT dst_group__dc34ab12__common-sites-cloud-access__"
+            )
+            == 2
         )
-        assert config.count("http_access deny src__ab12cd34__local-source rule_dst__ab12cd34__allow-common-sites") == 1
+        assert (
+            config.count(
+                "http_access deny src__ab12cd34__local-source dst_group__dc34ab12__common-sites-cloud-access__"
+            )
+            == 1
+        )
 
     def test_render_declares_all_rule_acls_before_access_rules(self) -> None:
         """Declare every generated rule ACL before source access statements can use it."""
@@ -688,6 +708,15 @@ class TestSquidConfigValidation(TestCase):
             )
             rule.sources.add(source)
             rule.destinations.add(destination)
+            rule.destinations.add(
+                DestinationConfig.objects.create(
+                    service="test-service",
+                    name=f"second-destination-{index}",
+                    key_prefix="ab12cd34",
+                    dst=f"second-destination-{index}.example.com",
+                    type="ALLOW",
+                )
+            )
 
         config = render_squid_config()
         rule_acl_positions = [config.index(f"acl rule_dst__ab12cd34__rule-{index}__1") for index in range(2)]
@@ -721,9 +750,8 @@ class TestSquidConfigValidation(TestCase):
 
         config = render_squid_config()
 
-        assert config.index("http_access allow src__ab12cd34__a-source") < config.index(
-            "http_access allow src__ab12cd34__z-source"
-        )
+        assert ("acl rule_src__ab12cd34__rule any-of src__ab12cd34__a-source src__ab12cd34__z-source") in config
+        assert config.count("http_access allow rule_src__ab12cd34__rule") == 1
 
     def test_render_orders_rules_by_priority_type_then_creation_time(self) -> None:
         """Order access rules by ascending priority, action type, then creation time."""
@@ -763,7 +791,7 @@ class TestSquidConfigValidation(TestCase):
         config = render_squid_config()
         access_lines = [line for line in config.splitlines() if line.startswith("http_access ") and "src__" in line]
 
-        assert [line.split("rule_dst__ab12cd34__", 1)[1].split("__1", 1)[0] for line in access_lines] == [
+        assert [line.split(" dst__ab12cd34__", 1)[1].split(" port__", 1)[0] for line in access_lines] == [
             "priority-99-allow",
             "priority-100-deny",
             "priority-100-connect",
@@ -772,7 +800,7 @@ class TestSquidConfigValidation(TestCase):
         ]
         connect_lines = [line for line in access_lines if " CONNECT " in line]
         assert len(connect_lines) == 1
-        assert "rule_dst__ab12cd34__priority-100-connect__1" in connect_lines[0]
+        assert "dst__ab12cd34__priority-100-connect" in connect_lines[0]
 
     def test_render_places_comments_before_their_acl_blocks(self) -> None:
         """Configured comments label their source, destination, and logical rule exactly once."""
@@ -815,9 +843,9 @@ class TestSquidConfigValidation(TestCase):
     def test_squid_validation_failure_returns_422(self) -> None:
         """When Squid config validation fails, the API returns 422 and rolls back."""
         with (
-            patch("terrasquid.api.views.render_squid_config", return_value="bad config"),
+            patch("terrasquid.api.policy.render_squid_config", return_value="bad config"),
             patch(
-                "terrasquid.api.views.validate_squid_config",
+                "terrasquid.api.policy.validate_squid_config",
                 return_value=(False, "syntax error"),
             ),
         ):
@@ -833,9 +861,9 @@ class TestSquidConfigValidation(TestCase):
         from terrasquid.api.models import SourceACL
 
         with (
-            patch("terrasquid.api.views.render_squid_config", return_value="bad"),
+            patch("terrasquid.api.policy.render_squid_config", return_value="bad"),
             patch(
-                "terrasquid.api.views.validate_squid_config",
+                "terrasquid.api.policy.validate_squid_config",
                 return_value=(False, "error"),
             ),
         ):
@@ -857,14 +885,75 @@ class TestConfigVersionHistory(TestCase):
         ConfigVersion.increment("# config v1")
         assert RenderedConfigHistory.objects.filter(version=1, rendered_config="# config v1").exists()
 
-    def test_increment_updates_history_for_same_version(self) -> None:
-        """Calling increment twice updates the history entry for each version."""
+    def test_increment_creates_distinct_history_versions(self) -> None:
+        """Calling increment twice preserves separate immutable history entries."""
         from terrasquid.api.models import ConfigVersion, RenderedConfigHistory
 
         ConfigVersion.increment("# config v1")
         ConfigVersion.increment("# config v2")
         assert RenderedConfigHistory.objects.count() == 2
         assert RenderedConfigHistory.objects.get(version=2).rendered_config == "# config v2"
+
+    def test_duplicate_history_version_rolls_back_increment(self) -> None:
+        """A conflicting history entry must not be overwritten or advance the version."""
+        from django.db import IntegrityError
+        from terrasquid.api.models import ConfigVersion, RenderedConfigHistory
+
+        RenderedConfigHistory.objects.create(version=1, rendered_config="# original")
+        with self.assertRaises(IntegrityError):
+            ConfigVersion.increment("# replacement")
+
+        assert ConfigVersion.get().version == 0
+        assert RenderedConfigHistory.objects.get(version=1).rendered_config == "# original"
+
+    @override_settings(SQUID_PINNED_CONFIG_VERSION=7)
+    def test_increment_prunes_history_without_removing_active_pin(self) -> None:
+        """Each new version must enforce retention while protecting the active pin."""
+        from terrasquid.api.models import ConfigVersion, RenderedConfigHistory
+
+        with patch.object(RenderedConfigHistory, "prune") as prune:
+            ConfigVersion.increment("# config v1")
+
+        prune.assert_called_once_with(pinned_version=7)
+
+    def test_prune_keeps_recent_versions_and_latest_per_older_utc_day(self) -> None:
+        """Retention keeps all trailing-day entries and one latest entry per older day."""
+        from terrasquid.api.models import RenderedConfigHistory
+
+        now = datetime(2026, 9, 18, 12, tzinfo=UTC)
+        entries = [
+            RenderedConfigHistory.objects.create(version=version, rendered_config=f"# config v{version}")
+            for version in range(1, 7)
+        ]
+        timestamps = [
+            now - timedelta(hours=2),
+            now - timedelta(hours=23),
+            datetime(2026, 9, 16, 20, tzinfo=UTC),
+            datetime(2026, 9, 16, 8, tzinfo=UTC),
+            datetime(2026, 9, 15, 20, tzinfo=UTC),
+            datetime(2026, 9, 15, 8, tzinfo=UTC),
+        ]
+        for entry, created_at in zip(entries, timestamps, strict=True):
+            RenderedConfigHistory.objects.filter(pk=entry.pk).update(created_at=created_at)
+
+        deleted = RenderedConfigHistory.prune(now=now)
+
+        assert deleted == 2
+        assert set(RenderedConfigHistory.objects.values_list("version", flat=True)) == {1, 2, 3, 5}
+
+    def test_prune_uses_pinned_version_as_older_day_representative(self) -> None:
+        """Retention must not remove the currently pinned historical config."""
+        from terrasquid.api.models import RenderedConfigHistory
+
+        now = datetime(2026, 9, 18, 12, tzinfo=UTC)
+        latest = RenderedConfigHistory.objects.create(version=1, rendered_config="# latest that day")
+        pinned = RenderedConfigHistory.objects.create(version=2, rendered_config="# pinned")
+        RenderedConfigHistory.objects.filter(pk=latest.pk).update(created_at=datetime(2026, 9, 16, 20, tzinfo=UTC))
+        RenderedConfigHistory.objects.filter(pk=pinned.pk).update(created_at=datetime(2026, 9, 16, 8, tzinfo=UTC))
+
+        RenderedConfigHistory.prune(now=now, pinned_version=pinned.version)
+
+        assert set(RenderedConfigHistory.objects.values_list("version", flat=True)) == {2}
 
 
 class TestRenderSquidConfigPinning(TestCase):

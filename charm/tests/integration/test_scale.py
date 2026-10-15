@@ -32,7 +32,7 @@ _UNIT_ENV_FILE = "/etc/terrasquid/terrasquid.env"
 _SQUID_CONF = "/etc/squid/squid.conf"
 
 SOURCE_COUNT = 1000
-_ACL_KEY_PREFIX = re.compile(r"\b(?P<kind>src|dst|rule_dst)__[A-Za-z0-9]+__")
+_ACL_KEY_PREFIX = re.compile(r"\b(?P<kind>src|dst|dst_group|rule_src|rule_dst)__[A-Za-z0-9]+__")
 
 # Local snapshot file — persists across runs so the config can be diffed.
 _SNAPSHOT_PATH = CHARM_DIR / "tests" / "integration" / "squid_scale_snapshot.conf"
@@ -147,15 +147,24 @@ def _assert_squid_conf_matches_snapshot(config: str, snapshot_path: Path) -> Non
 def test_canonical_squid_conf_preserves_rule_order() -> None:
     """Canonicalization replaces key prefixes without reordering access rules."""
     config = """\
+acl rule_src__prefix__sources any-of src__prefix__a-source src__prefix__z-source
+acl dst_group__prefix__sites__1 any-of dst__prefix__destination
 http_access allow src__prefix__a-source rule_dst__prefix__priority-99__1 port__80
 http_access allow src__prefix__z-source rule_dst__prefix__priority-100__1 port__80
+http_access allow rule_src__prefix__sources dst_group__prefix__sites__1 port__80
 """
 
-    access_lines = [line for line in _canonical_squid_conf(config).splitlines() if line.startswith("http_access")]
+    canonical_config = _canonical_squid_conf(config)
+    assert "acl rule_src__KEY_PREFIX__sources any-of src__KEY_PREFIX__a-source src__KEY_PREFIX__z-source" in (
+        canonical_config
+    )
+    assert "acl dst_group__KEY_PREFIX__sites__1 any-of dst__KEY_PREFIX__destination" in canonical_config
+    access_lines = [line for line in canonical_config.splitlines() if line.startswith("http_access")]
 
     assert access_lines == [
         "http_access allow src__KEY_PREFIX__a-source rule_dst__KEY_PREFIX__priority-99__1 port__80",
         "http_access allow src__KEY_PREFIX__z-source rule_dst__KEY_PREFIX__priority-100__1 port__80",
+        "http_access allow rule_src__KEY_PREFIX__sources dst_group__KEY_PREFIX__sites__1 port__80",
     ]
 
 

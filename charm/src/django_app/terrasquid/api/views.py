@@ -7,7 +7,6 @@ from pathlib import Path
 from django.conf import settings
 from django.db import transaction
 from rest_framework import status, viewsets
-from rest_framework.exceptions import APIException
 from rest_framework.permissions import AllowAny
 from rest_framework.request import Request
 from rest_framework.response import Response
@@ -21,22 +20,15 @@ from .models import (
     SourceACL,
 )
 from .permissions import ServiceAPIKeyPermission
+from .policy import SquidConfigError, publish_policy
 from .serializers import (
     ACLRuleSerializer,
     DestinationConfigSerializer,
     DestinationGroupSerializer,
     SourceACLSerializer,
 )
-from .squid_render import render_squid_config, validate_squid_config
 
 logger = logging.getLogger(__name__)
-
-
-class SquidConfigError(APIException):
-    """Raised when Squid configuration validation fails after a write."""
-
-    status_code = status.HTTP_422_UNPROCESSABLE_ENTITY
-    default_code = "squid_config_invalid"
 
 
 class StatusView(APIView):
@@ -70,15 +62,6 @@ def _load_unit_status() -> dict:
     return {}
 
 
-def _post_write_render() -> None:
-    """Render the Squid config from current DB state, validate, and update ConfigVersion."""
-    rendered = render_squid_config()
-    ok, err = validate_squid_config(rendered)
-    if not ok:
-        raise SquidConfigError(detail=f"Squid configuration validation failed: {err}")
-    ConfigVersion.increment(rendered)
-
-
 class ServiceModelViewSet(viewsets.ModelViewSet):
     """Base ViewSet that scopes all querysets to the authenticated service."""
 
@@ -103,12 +86,7 @@ class ServiceModelViewSet(viewsets.ModelViewSet):
             key_prefix=self.request.api_key.prefix,
         )
 
-    def _validate_squid_after_change(self, proposed_rendered: str) -> None:
-        """Run squid config validation; raise ValidationError on failure."""
-        ok, err = validate_squid_config(proposed_rendered)
-        if not ok:
-            raise SquidConfigError(detail=f"Squid configuration validation failed: {err}")
-
+    @ConfigVersion.locked()
     def create(self, request: Request, *args, **kwargs) -> Response:
         """Create or return existing resource (idempotent by (service, name))."""
         name = request.data.get("name")
@@ -129,9 +107,7 @@ class ServiceModelViewSet(viewsets.ModelViewSet):
                 self.perform_create(serializer)
             except ValidationError as e:
                 raise SquidConfigError(detail=str(e)) from e
-            rendered = render_squid_config()
-            self._validate_squid_after_change(rendered)
-            ConfigVersion.increment(rendered)
+            publish_policy()
 
     def perform_update_with_squid_validation(self, serializer) -> None:
         """Update the model and validate Squid config, rolling back on failure."""
@@ -142,9 +118,7 @@ class ServiceModelViewSet(viewsets.ModelViewSet):
                 self.perform_update(serializer)
             except ValidationError as e:
                 raise SquidConfigError(detail=str(e)) from e
-            rendered = render_squid_config()
-            self._validate_squid_after_change(rendered)
-            ConfigVersion.increment(rendered)
+            publish_policy()
 
 
 class SourceACLViewSet(ServiceModelViewSet):
@@ -153,6 +127,7 @@ class SourceACLViewSet(ServiceModelViewSet):
     queryset = SourceACL.objects.all()
     serializer_class = SourceACLSerializer
 
+    @ConfigVersion.locked()
     def update(self, request: Request, *args, **kwargs) -> Response:
         """Update a SourceACL with Squid config validation."""
         partial = kwargs.pop("partial", False)
@@ -162,6 +137,7 @@ class SourceACLViewSet(ServiceModelViewSet):
         self.perform_update_with_squid_validation(serializer)
         return Response(serializer.data)
 
+    @ConfigVersion.locked()
     def destroy(self, request: Request, *args, **kwargs) -> Response:
         """Delete a SourceACL, rejecting with 409 if referenced by other resources."""
         instance = self.get_object()
@@ -172,7 +148,7 @@ class SourceACLViewSet(ServiceModelViewSet):
             )
         with transaction.atomic():
             instance.delete()
-            _post_write_render()
+            publish_policy()
         return Response(status=status.HTTP_204_NO_CONTENT)
 
 
@@ -182,6 +158,7 @@ class DestinationConfigViewSet(ServiceModelViewSet):
     queryset = DestinationConfig.objects.all()
     serializer_class = DestinationConfigSerializer
 
+    @ConfigVersion.locked()
     def update(self, request: Request, *args, **kwargs) -> Response:
         """Update a DestinationConfig with Squid config validation."""
         partial = kwargs.pop("partial", False)
@@ -191,6 +168,7 @@ class DestinationConfigViewSet(ServiceModelViewSet):
         self.perform_update_with_squid_validation(serializer)
         return Response(serializer.data)
 
+    @ConfigVersion.locked()
     def destroy(self, request: Request, *args, **kwargs) -> Response:
         """Delete a DestinationConfig, rejecting with 409 if referenced."""
         instance = self.get_object()
@@ -201,7 +179,7 @@ class DestinationConfigViewSet(ServiceModelViewSet):
             )
         with transaction.atomic():
             instance.delete()
-            _post_write_render()
+            publish_policy()
         return Response(status=status.HTTP_204_NO_CONTENT)
 
 
@@ -221,6 +199,7 @@ class DestinationGroupViewSet(ServiceModelViewSet):
             return queryset.filter(service=self.request.api_key.name)
         return queryset
 
+    @ConfigVersion.locked()
     def create(self, request: Request, *args, **kwargs) -> Response:
         """Create a group or return the owner's existing group with the same name."""
         name = request.data.get("name")
@@ -234,6 +213,7 @@ class DestinationGroupViewSet(ServiceModelViewSet):
             )
         return super().create(request, *args, **kwargs)
 
+    @ConfigVersion.locked()
     def update(self, request: Request, *args, **kwargs) -> Response:
         """Update a group with Squid config validation."""
         partial = kwargs.pop("partial", False)
@@ -248,6 +228,7 @@ class DestinationGroupViewSet(ServiceModelViewSet):
         self.perform_update_with_squid_validation(serializer)
         return Response(serializer.data)
 
+    @ConfigVersion.locked()
     def destroy(self, request: Request, *args, **kwargs) -> Response:
         """Delete an owner-managed group unless ACL rules still reference it."""
         instance = self.get_object()
@@ -263,7 +244,7 @@ class DestinationGroupViewSet(ServiceModelViewSet):
             )
         with transaction.atomic():
             instance.delete()
-            _post_write_render()
+            publish_policy()
         return Response(status=status.HTTP_204_NO_CONTENT)
 
 
@@ -273,6 +254,7 @@ class ACLRuleViewSet(ServiceModelViewSet):
     queryset = ACLRule.objects.prefetch_related("sources", "destinations", "destination_groups__destinations")
     serializer_class = ACLRuleSerializer
 
+    @ConfigVersion.locked()
     def update(self, request: Request, *args, **kwargs) -> Response:
         """Update an ACLRule with Squid config validation."""
         partial = kwargs.pop("partial", False)
@@ -282,10 +264,11 @@ class ACLRuleViewSet(ServiceModelViewSet):
         self.perform_update_with_squid_validation(serializer)
         return Response(serializer.data)
 
+    @ConfigVersion.locked()
     def destroy(self, request: Request, *args, **kwargs) -> Response:
         """Delete an ACLRule."""
         instance = self.get_object()
         with transaction.atomic():
             instance.delete()
-            _post_write_render()
+            publish_policy()
         return Response(status=status.HTTP_204_NO_CONTENT)

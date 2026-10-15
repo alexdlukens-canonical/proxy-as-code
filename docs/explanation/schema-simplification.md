@@ -103,19 +103,27 @@ At least one of `destinations` or `destination_groups` is required. The `src`,
 
 ## Squid rendering
 
-Each `acl_rule` combines direct and grouped destinations, deduplicates them,
-and partitions them by destination type, effective port set, and destination
-kind (`dst` for CIDRs or `dstdomain` for names). Each compatible partition emits
-one destination ACL, one port ACL, and one `http_access` line per source:
+Each `destination_config` emits one authoritative `dst__` ACL. Referenced
+destination groups partition their destinations by action and effective port
+set, then emit reusable Squid `any-of` ACLs containing references to the
+`dst__` ACLs. Rules refer to the group ACLs and any directly attached
+destinations instead of copying destination values.
+
+Each rule emits a destination selector for every action and port partition.
+When a directly attached destination is already covered by an attached group,
+the duplicate reference is removed. Rules with multiple sources also emit an
+`any-of` source selector, avoiding one access line for every source and
+destination partition combination:
 
 ```
-http_access <action> src__<svc>__<src> rule_dst__<rule>__<bucket> rule_dstport__<rule>__<bucket>
+http_access <action> <source-selector> rule_dst__<rule>__<bucket> port__<ports>
 ```
 
 The action is `allow` when the destination `type` is `ALLOW` or `CONNECT`, and
 `deny` otherwise. Partitioning prevents an unconfigured site/port combination
-from being allowed. The source-group and port-group sections of the template are
-removed. Access entries are rendered by priority ascending, then destination
+from being allowed. Squid `any-of` selectors can compose both domain and CIDR
+destination ACLs, so destination kind does not create an additional rule
+partition. Access entries are rendered by priority ascending, then destination
 type (`DENY`, `CONNECT`, `ALLOW`), then rule creation time. Stable identifiers
 break any remaining ties so repeated renders are deterministic.
 

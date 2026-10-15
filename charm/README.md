@@ -1,10 +1,51 @@
 # Terrasquid Charm
 
+## Persistent credentials
+
+The Django `SECRET_KEY` is stored in the application-owned Juju secret labelled
+`terrasquid-django`. All units use the same key, and replacement units retrieve it
+from Juju rather than generating a new one. This requires Juju 3 or later.
+
+On upgrade from a revision with a local `/var/lib/terrasquid/secret_key`, the leader
+copies its existing key unchanged into the Juju secret before removing the local
+file. If storing the secret fails, the file is retained and the hook fails for
+retry. An existing Juju secret is never overwritten by a unit's local key.
+Followers wait for the shared key before configuring the workload. Previously,
+each unit had its own key; adopting the leader's key can invalidate sessions
+signed by another unit's old key.
+
+Database credentials remain managed by the PostgreSQL relation. TLS private keys
+are already stored in Juju secrets by the certificates library and can be
+reissued for replacement units. API keys and superuser passwords are stored as
+hashes in PostgreSQL, not recoverable plaintext secrets; retain the original API
+key or rotate it if lost. Protect and back up both the Juju controller's secret
+storage and PostgreSQL: application secrets survive unit replacement, not
+application removal or loss of the controller's secret store.
+
+The workload still needs a local environment file containing the Django key and
+database URL. The charm creates it with restricted permissions (0640).
+
 ## Unit tests
 
 With Python 3.12 available, install `tox` and `tox-uv`, then run `tox -e unit`
 from the `charm/` directory. GitHub Actions runs the same unit suite on pull
 requests that change files under `charm/`.
+
+The unit command measures line and branch coverage for all Python code under
+`src/`, including the charm and Django application, but not vendored libraries
+under `lib/`. It lists uncovered lines in the terminal and writes an HTML report
+to `htmlcov/index.html` and a machine-readable report to `coverage.xml`.
+Open the HTML report in a browser to inspect uncovered lines and branches.
+Generated reports and coverage data are ignored by Git.
+
+To focus on one test class, run `tox -e unit -- -k TestInstall`.
+Coverage still includes all of `src/`, so a focused run will report lower overall
+coverage. To run without coverage, use `tox -e unit -- --no-cov`.
+No minimum coverage threshold is enforced.
+
+GitHub Actions uploads the HTML and XML reports as the `charm-unit-coverage`
+artifact, including when tests fail and reports are available. Download the
+artifact from the workflow run to inspect coverage.
 
 Charm libraries under `charm/lib/` are vendored dependencies and must be committed
 so the tests work from a clean checkout.
@@ -14,6 +55,34 @@ To test the workflow locally with act, run
 from the repository root. If act reports an unsupported platform, add
 `-P ubuntu-24.04=catthehacker/ubuntu:act-24.04` to the command or to your act
 configuration file. This runs the job but does not verify GitHub's PR path filter.
+## Roll back the applied Squid configuration
+
+Terrasquid retains every complete rendered Squid configuration from the trailing
+24 hours. For older history, it retains the latest revision from each UTC day.
+If an older revision is pinned, that revision becomes the retained revision for
+its day. In Django admin, open **Rendered config histories** and select a version
+to inspect the exact configuration that was generated.
+
+To apply a retained version across every unit, set the application-wide pin:
+
+```shell
+juju config <application> squid-pinned-config-version=<version>
+```
+
+Pinning changes the configuration applied to Squid. It does not rewind sources,
+destinations, or ACL rules managed through the API or Terraform. Those resources
+remain at their latest state, and writes continue to create new database config
+versions.
+
+Check `/api/v1/status/` on each unit after the watcher runs. While pinned,
+`applied_config_version` should equal the selected version and may differ from
+`db_config_version`.
+
+To resume the latest rendered configuration, clear the pin:
+
+```shell
+juju config <application> squid-pinned-config-version=0
+```
 
 ## Grafana Dashboards
 

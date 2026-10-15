@@ -38,6 +38,20 @@ acl dst__{{ dst.key_prefix }}__{{ dst.name }} dstdomain {{ dst.dst }}
 
 {% endfor %}
 
+# ======= Destination Group ACLs =======
+{% for entry in destination_group_entries %}
+{% if entry.group.comment %}
+# {{ entry.group.comment }}
+{% else %}
+# Service: {{ entry.group.service }}; group: {{ entry.group.name }}
+{% endif %}
+{% for bucket in entry.buckets %}
+{% for line in bucket.destination_acl_names | any_of_lines(bucket.acl_name) %}
+{{ line }}
+{% endfor %}
+{% endfor %}
+{% endfor %}
+
 # ======= Port ACLs =======
 {% for ports in port_sets %}
 acl port__{{ ports | join('_') }} port {{ ports | join(' ') }}
@@ -47,14 +61,24 @@ acl port__{{ ports | join('_') }} port {{ ports | join(' ') }}
 acl CONNECT method CONNECT
 
 # ======= ACL Rules (ordered by priority) =======
-{% for rule in acl_rules %}
+{% for entry in rule_entries %}
+{% set rule = entry.rule %}
 {% if rule.comment %}
 # {{ rule.comment }}
 {% else %}
 # Service: {{ rule.service }}; rule: {{ rule.name }}
 {% endif %}
-{% for bucket in rule.effective_destination_buckets %}
-acl rule_dst__{{ rule.key_prefix }}__{{ rule.name }}__{{ bucket.index }} {{ bucket.destination_kind }} {% for dst in bucket.destinations %}{{ dst.dst }}{% if not loop.last %} {% endif %}{% endfor %}{{ '\n' }}
+{% if entry.source_acl_names | length > 1 %}
+{% for line in entry.source_acl_names | any_of_lines(entry.source_acl_name) %}
+{{ line }}
+{% endfor %}
+{% endif %}
+{% for bucket in entry.buckets %}
+{% if bucket.destination_acl_names | length > 1 %}
+{% for line in bucket.destination_acl_names | any_of_lines(bucket.destination_acl_name) %}
+{{ line }}
+{% endfor %}
+{% endif %}
 {% endfor %}
 
 {% endfor %}
@@ -62,9 +86,7 @@ acl rule_dst__{{ rule.key_prefix }}__{{ rule.name }}__{{ bucket.index }} {{ buck
 {% set rule = entry.rule %}
 {% set bucket = entry.bucket %}
 {% set action = 'allow' if bucket.type in ('ALLOW', 'CONNECT') else 'deny' %}
-{% for src in rule.sources.all() %}
-http_access {{ action }} src__{{ src.key_prefix }}__{{ src.name }}{% if bucket.type == 'CONNECT' %} CONNECT{% endif %} rule_dst__{{ rule.key_prefix }}__{{ rule.name }}__{{ bucket.index }} port__{{ bucket.ports | join('_') }}
-{% endfor %}
+http_access {{ action }} {{ entry.source_acl_name }}{% if bucket.type == 'CONNECT' %} CONNECT{% endif %} {{ bucket.destination_acl_name }} port__{{ bucket.ports | join('_') }}
 {% endfor %}
 
 {% if squid_append_config %}

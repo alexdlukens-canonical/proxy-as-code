@@ -51,6 +51,9 @@ GUNICORN_CONF_FILE = Path("/etc/terrasquid/gunicorn.conf.py")
 SQUID_WATCHER_SERVICE = "terrasquid-watcher"
 SQUID_WATCHER_TIMER = "terrasquid-watcher.timer"
 SQUID_EXPORTER_PORT = 9301
+DJANGO_SECRET_LABEL = "terrasquid-django"
+DJANGO_SECRET_ID_KEY = "django-secret-id"
+SECRET_WAIT_MESSAGE = "Waiting for leader to create application secret"
 
 
 class SquidAsAServiceCharm(ops.CharmBase):
@@ -96,6 +99,7 @@ class SquidAsAServiceCharm(ops.CharmBase):
         self.framework.observe(self.on.leader_elected, self._on_leader_elected)
 
         self.framework.observe(self.on.squid_aaas_peers_relation_changed, self._on_peers_relation_changed)
+        self.framework.observe(self.on.squid_aaas_peers_relation_joined, self._on_peers_relation_changed)
         self.framework.observe(self.on.cos_agent_relation_changed, self._on_cos_agent_relation_changed)
         self.framework.observe(self.on.cos_agent_relation_departed, self._on_cos_agent_relation_changed)
         self.framework.observe(self.on.cos_agent_relation_broken, self._on_cos_agent_relation_changed)
@@ -119,15 +123,17 @@ class SquidAsAServiceCharm(ops.CharmBase):
         self._write_systemd_units()
         subprocess.run(["systemctl", "daemon-reload"], check=True)
 
-    def _on_config_changed(self, _event: ops.ConfigChangedEvent) -> None:
+    def _on_config_changed(self, event: ops.ConfigChangedEvent) -> None:
         if not self._database_url():
+            return
+        if not self._write_env_file():
+            event.defer()
             return
         self._request_certificate()
         self._write_gunicorn_config()
         self._write_watcher_timer()
         subprocess.run(["systemctl", "daemon-reload"], check=True)
         subprocess.run(["systemctl", "reload-or-restart", SQUID_WATCHER_TIMER], capture_output=True)
-        self._write_env_file()
         self._reload_gunicorn()
         subprocess.run(["systemctl", "restart", squid.SQUID_EXPORTER_SERVICE], check=True)
         if self._gunicorn_running():
@@ -135,9 +141,12 @@ class SquidAsAServiceCharm(ops.CharmBase):
         self._publish_django_ingress_requirements()
         self._publish_squid_ingress_requirements()
 
-    def _on_start(self, _event: ops.StartEvent) -> None:
+    def _on_start(self, event: ops.StartEvent) -> None:
         if not self._database_url():
             self.unit.status = ops.WaitingStatus("Waiting for database relation")
+            return
+        if not self._write_env_file():
+            event.defer()
             return
         self._start_services()
 
@@ -150,9 +159,14 @@ class SquidAsAServiceCharm(ops.CharmBase):
         squid.install_squid()
         self._write_systemd_units()
         subprocess.run(["systemctl", "daemon-reload"], check=True)
+        if self._get_or_generate_secret_key() is None:
+            event.defer()
+            return
         if not self._database_url():
             return
-        self._write_env_file()
+        if not self._write_env_file():
+            event.defer()
+            return
         try:
             if self.unit.is_leader():
                 self._clear_migration_flag()
@@ -180,10 +194,15 @@ class SquidAsAServiceCharm(ops.CharmBase):
         if not self._database_url():
             event.add_status(ops.WaitingStatus("Waiting for database relation"))
             return
+        if self.unit.status == ops.WaitingStatus(SECRET_WAIT_MESSAGE):
+            event.add_status(ops.WaitingStatus(SECRET_WAIT_MESSAGE))
+            return
         if not self._gunicorn_running():
             event.add_status(ops.MaintenanceStatus("Starting API service"))
             return
-        self._sync_config_version_if_stale()
+        if not self._sync_config_version_if_stale():
+            event.add_status(ops.BlockedStatus("Failed to reconcile Squid configuration"))
+            return
         api_status = "up"
         squid_status = "up" if squid.squid_service_running() else "down"
         config_version = self._read_applied_config_version()
@@ -203,6 +222,7 @@ class SquidAsAServiceCharm(ops.CharmBase):
         self._publish_squid_ingress_requirements()
 
     def _on_leader_elected(self, _event: ops.LeaderElectedEvent) -> None:
+        self._get_or_generate_secret_key()
         self._publish_django_ingress_requirements()
         self._publish_squid_ingress_requirements()
 
@@ -210,7 +230,9 @@ class SquidAsAServiceCharm(ops.CharmBase):
 
     def _on_database_created(self, event: DatabaseCreatedEvent) -> None:
         self.unit.status = ops.MaintenanceStatus("Configuring database")
-        self._write_env_file()
+        if not self._write_env_file():
+            event.defer()
+            return
         try:
             if self.unit.is_leader():
                 self._run_manage("migrate", "--noinput")
@@ -233,7 +255,9 @@ class SquidAsAServiceCharm(ops.CharmBase):
         self._publish_squid_ingress_requirements()
 
     def _on_database_endpoints_changed(self, event: DatabaseEndpointsChangedEvent) -> None:
-        self._write_env_file()
+        if not self._write_env_file():
+            event.defer()
+            return
         self._reload_gunicorn()
 
     def _on_database_relation_broken(self, _event: ops.RelationBrokenEvent) -> None:
@@ -242,11 +266,18 @@ class SquidAsAServiceCharm(ops.CharmBase):
 
     # ── Peer relation ─────────────────────────────────────────────────────────
 
-    def _on_peers_relation_changed(self, _event: ops.RelationChangedEvent) -> None:
+    def _on_peers_relation_changed(self, event: ops.RelationEvent) -> None:
         if self.unit.is_leader():
+            self._get_or_generate_secret_key()
             return
         if not self._database_url():
             return
+        previous = TERRASQUID_ENV_FILE.read_text() if TERRASQUID_ENV_FILE.exists() else ""
+        if not self._write_env_file():
+            event.defer()
+            return
+        if TERRASQUID_ENV_FILE.read_text() != previous and self._gunicorn_running():
+            subprocess.run(["systemctl", "restart", GUNICORN_SERVICE], check=True)
         if self._migration_complete() and not self._gunicorn_running():
             try:
                 self._run_manage("collectstatic", "--noinput")
@@ -377,7 +408,9 @@ class SquidAsAServiceCharm(ops.CharmBase):
         endpoint = (
             "" if isinstance(event, (ops.RelationDepartedEvent, ops.RelationBrokenEvent)) else self._tracing_endpoint()
         )
-        self._write_env_file(tracing_endpoint=endpoint)
+        if not self._write_env_file(tracing_endpoint=endpoint):
+            event.defer()
+            return
         if TERRASQUID_ENV_FILE.read_text() != previous and self._gunicorn_running():
             # HUP reloads workers but does not refresh the master's systemd environment.
             subprocess.run(["systemctl", "restart", GUNICORN_SERVICE], check=True)
@@ -408,10 +441,12 @@ class SquidAsAServiceCharm(ops.CharmBase):
         host_port = endpoints.split(",")[0]
         return f"postgresql://{username}:{quote(password, safe='')}@{host_port}/{database}"
 
-    def _write_env_file(self, *, tracing_endpoint: str | None = None) -> None:
-        """Write environment variables to /etc/terrasquid/terrasquid.env."""
+    def _write_env_file(self, *, tracing_endpoint: str | None = None) -> bool:
+        """Write the workload environment once the application secret is available."""
         db_url = self._database_url()
         secret_key = self._get_or_generate_secret_key()
+        if secret_key is None:
+            return False
         squid_port = self.config.get("squid-port", 3128)
         squid_prepend_config = self.config.get("squid-prepend-config", "")
         squid_append_config = self.config.get("squid-append-config", "")
@@ -453,21 +488,42 @@ class SquidAsAServiceCharm(ops.CharmBase):
             OTEL_TRACES_SAMPLER_ARG=0.1
         """)
         TERRASQUID_ENV_FILE.parent.mkdir(parents=True, exist_ok=True)
-        TERRASQUID_ENV_FILE.write_text(content)
-        os.chmod(TERRASQUID_ENV_FILE, 0o640)
-
-    def _get_or_generate_secret_key(self) -> str:
-        """Return a stable SECRET_KEY, generating one on first call."""
-        key_file = TERRASQUID_RUN_DIR / "secret_key"
-        if key_file.exists():
-            return key_file.read_text().strip()
-        key = secrets.token_hex(50)
-        TERRASQUID_RUN_DIR.mkdir(parents=True, exist_ok=True)
-        old_umask = os.umask(0o177)
+        old_umask = os.umask(0o137)
         try:
-            key_file.write_text(key)
+            TERRASQUID_ENV_FILE.touch(mode=0o640, exist_ok=True)
+            os.chmod(TERRASQUID_ENV_FILE, 0o640)
+            TERRASQUID_ENV_FILE.write_text(content)
         finally:
             os.umask(old_umask)
+        if self.unit.status == ops.WaitingStatus(SECRET_WAIT_MESSAGE):
+            self.unit.status = ops.MaintenanceStatus("Configuring application")
+        return True
+
+    def _get_or_generate_secret_key(self) -> str | None:
+        """Retrieve the application key, migrating the leader's local key if needed."""
+        key_file = TERRASQUID_RUN_DIR / "secret_key"
+        peer = self.model.get_relation("squid-aaas-peers")
+        secret_id = peer.data[self.app].get(DJANGO_SECRET_ID_KEY) if peer else None
+        try:
+            secret = (
+                self.model.get_secret(id=secret_id) if secret_id else self.model.get_secret(label=DJANGO_SECRET_LABEL)
+            )
+        except ops.SecretNotFoundError:
+            if secret_id:
+                raise
+            if not self.unit.is_leader():
+                self.unit.status = ops.WaitingStatus(SECRET_WAIT_MESSAGE)
+                return None
+            key = key_file.read_text().strip() if key_file.exists() else secrets.token_hex(50)
+            if not key:
+                raise ValueError("Cannot migrate an empty Django secret key") from None
+            secret = self.app.add_secret({"secret-key": key}, label=DJANGO_SECRET_LABEL)
+        key = secret.get_content()["secret-key"]
+        if not key:
+            raise ValueError("Django application secret contains an empty secret-key")
+        if peer and self.unit.is_leader():
+            peer.data[self.app][DJANGO_SECRET_ID_KEY] = secret.get_info().id
+        key_file.unlink(missing_ok=True)
         return key
 
     def _django_env(self) -> dict:
@@ -489,7 +545,7 @@ class SquidAsAServiceCharm(ops.CharmBase):
         subprocess.run(cmd, check=True, env=self._django_env(), cwd=str(DJANGO_APP_DIR))
 
     def _run_manage_capture(self, *args: str, extra_env: dict | None = None) -> tuple[str, str]:
-        """Run a Django management command and return (stdout, stderr)."""
+        """Return (stdout, error), with a nonempty error when the management command fails."""
         cmd = [str(VENV_BIN / "python"), str(DJANGO_APP_DIR / "manage.py"), *args]
         env = self._django_env()
         if extra_env:
@@ -502,7 +558,11 @@ class SquidAsAServiceCharm(ops.CharmBase):
             cwd=str(DJANGO_APP_DIR),
         )
         if result.returncode != 0:
-            return "", result.stderr.strip() or result.stdout.strip()
+            return "", (
+                result.stderr.strip()
+                or result.stdout.strip()
+                or f"Management command failed with exit code {result.returncode}"
+            )
         return result.stdout, ""
 
     def _write_gunicorn_config(self) -> None:
@@ -730,25 +790,25 @@ class SquidAsAServiceCharm(ops.CharmBase):
             return True
         return rel.data[self.app].get("db-migrated") == "true"
 
-    def _sync_config_version_if_stale(self) -> None:
+    def _sync_config_version_if_stale(self) -> bool:
         """Re-render the Squid config and bump ConfigVersion if DB state diverges from the stored render."""
         if not self.unit.is_leader():
-            return
+            return True
         out, err = self._run_manage_capture(
             "shell",
             "-c",
             (
-                "from terrasquid.api.models import ConfigVersion;"
-                "from terrasquid.api.squid_render import render_squid_config;"
-                "cv = ConfigVersion.get();"
-                "rendered = render_squid_config(version=cv.version);"
-                "changed = cv.rendered_config != rendered;"
-                "changed and ConfigVersion.increment(render_squid_config());"
+                "from terrasquid.api.policy import reconcile_policy;"
+                "changed = reconcile_policy();"
                 "print('stale' if changed else 'ok')"
             ),
         )
+        if err:
+            logger.error("Failed to reconcile Squid configuration: %s", err)
+            return False
         if out.strip() == "stale":
             logger.info("Config version bumped: DB state diverged from stored render (e.g. admin edit)")
+        return True
 
     def _read_applied_config_version(self) -> int:
         if not TERRASQUID_STATUS_FILE.exists():

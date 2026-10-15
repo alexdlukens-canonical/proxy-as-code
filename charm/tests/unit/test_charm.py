@@ -1,6 +1,7 @@
 """Unit tests for the SquidAsAServiceCharm ops lifecycle."""
 
 import json
+import subprocess
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -38,7 +39,6 @@ def base_state():
             "squid-watcher-interval": 30,
             "api-port": 8080,
             "gunicorn-workers": 4,
-            "squid-extra-config": "",
         }
     )
 
@@ -87,6 +87,85 @@ class TestStart:
         assert any("terrasquid-squid-exporter" in s for s in started)
 
 
+class TestManagementCommands:
+    """Tests for captured management-command results."""
+
+    @pytest.mark.parametrize(
+        ("returncode", "stdout", "stderr", "expected"),
+        [
+            (0, "ok\n", "warning\n", ("ok\n", "")),
+            (1, "stdout error\n", "stderr error\n", ("", "stderr error")),
+            (1, "stdout error\n", "", ("", "stdout error")),
+            (1, "", "", ("", "Management command failed with exit code 1")),
+            (-9, "", "", ("", "Management command failed with exit code -9")),
+            (1, " \n", "\n", ("", "Management command failed with exit code 1")),
+        ],
+    )
+    def test_captured_result(self, returncode, stdout, stderr, expected, no_subprocess, ctx):
+        """Failures always return an error, preferring captured diagnostics."""
+        from charm import SquidAsAServiceCharm
+
+        no_subprocess.return_value = subprocess.CompletedProcess(
+            args=["python", "manage.py", "shell"], returncode=returncode, stdout=stdout, stderr=stderr
+        )
+
+        assert SquidAsAServiceCharm._run_manage_capture(MagicMock(), "shell", "-c", "pass") == expected
+
+
+class TestPolicyReconciliation:
+    """Tests for the charm's serialized configuration publication path."""
+
+    def test_reconciliation_uses_shared_policy_helper(self, ctx):
+        """Leader reconciliation must use the same lock and validation as API writes."""
+        from charm import SquidAsAServiceCharm
+
+        charm = MagicMock()
+        charm.unit.is_leader.return_value = True
+        charm._run_manage_capture.return_value = ("stale", "")
+        assert SquidAsAServiceCharm._sync_config_version_if_stale(charm)
+        command = charm._run_manage_capture.call_args.args
+        assert command[:2] == ("shell", "-c")
+        assert "reconcile_policy()" in command[2]
+        assert "ConfigVersion.increment" not in command[2]
+
+    def test_reconciliation_failure_is_reported(self, ctx, caplog):
+        """A failed reconciliation must not look like a successful status check."""
+        from charm import SquidAsAServiceCharm
+
+        charm = MagicMock()
+        charm.unit.is_leader.return_value = True
+        charm._run_manage_capture.return_value = ("", "Squid configuration validation failed")
+        assert not SquidAsAServiceCharm._sync_config_version_if_stale(charm)
+        assert "Failed to reconcile Squid configuration" in caplog.text
+
+    @pytest.mark.parametrize("returncode", [1, -9])
+    def test_silent_command_failure_is_reported(self, returncode, no_subprocess, ctx, caplog):
+        """A command failing without output must not make reconciliation succeed."""
+        from charm import SquidAsAServiceCharm
+
+        no_subprocess.return_value = subprocess.CompletedProcess(
+            args=["python", "manage.py", "shell"], returncode=returncode, stdout="", stderr=""
+        )
+        charm = MagicMock()
+        charm.unit.is_leader.return_value = True
+        charm._run_manage_capture.return_value = SquidAsAServiceCharm._run_manage_capture(charm, "shell", "-c", "pass")
+
+        assert not SquidAsAServiceCharm._sync_config_version_if_stale(charm)
+        assert f"exit code {returncode}" in caplog.text
+
+    def test_collect_status_blocks_on_reconciliation_failure(self, ctx):
+        """Collect-status must preserve an explicit reconciliation error."""
+        from charm import SquidAsAServiceCharm
+
+        charm = MagicMock()
+        charm.model.relations = {}
+        charm.unit.status = ops.ActiveStatus()
+        charm._sync_config_version_if_stale.return_value = False
+        event = MagicMock()
+        SquidAsAServiceCharm._on_collect_unit_status(charm, event)
+        event.add_status.assert_called_once_with(ops.BlockedStatus("Failed to reconcile Squid configuration"))
+
+
 class TestWatcherTimer:
     """Tests for the Squid configuration watcher timer."""
 
@@ -125,6 +204,50 @@ class TestUpgrade:
         state = ctx.run(ctx.on.upgrade_charm(), ops.testing.State(relations={relation}))
         config = json.loads(state.get_relation(relation.id).local_unit_data["config"])
         assert config["tracing_protocols"] == ["otlp_http"]
+
+    @pytest.mark.parametrize(
+        ("leader", "migrated", "fails"),
+        [(True, False, False), (True, True, True), (False, True, False), (False, False, False)],
+    )
+    def test_upgrade_coordinates_migrations(self, leader, migrated, fails, ctx, base_state, no_subprocess):
+        """Only leaders migrate; followers defer until the migration flag is set."""
+        peer = ops.testing.PeerRelation("squid-aaas-peers", local_app_data={"db-migrated": "true" if migrated else ""})
+        state = ops.testing.State(config=base_state.config, leader=leader, relations={peer})
+        failure = subprocess.CalledProcessError(1, "migrate") if fails else None
+        with (
+            patch("charm.SquidAsAServiceCharm._write_systemd_units"),
+            patch("charm.SquidAsAServiceCharm._get_or_generate_secret_key", return_value="test-key"),
+            patch("charm.SquidAsAServiceCharm._write_env_file"),
+            patch("charm.SquidAsAServiceCharm._database_url", return_value="postgresql://db/terrasquid"),
+            patch("charm.SquidAsAServiceCharm._sync_config_version_if_stale"),
+            patch("charm.SquidAsAServiceCharm._run_manage", side_effect=failure) as manage,
+        ):
+            result = ctx.run(ctx.on.upgrade_charm(), state)
+
+        calls = [call.args for call in manage.call_args_list]
+        if leader:
+            assert calls[0] == ("migrate", "--noinput")
+            assert result.get_relation(peer.id).local_app_data.get("db-migrated", "") == ("" if fails else "true")
+        else:
+            assert ("migrate", "--noinput") not in calls
+        if not leader and not migrated:
+            assert result.deferred
+            manage.assert_not_called()
+        elif not fails:
+            assert calls[-1] == ("collectstatic", "--noinput")
+            assert not result.deferred
+            assert any(
+                call.args[0] == ["systemctl", "restart", "terrasquid-api"] for call in no_subprocess.call_args_list
+            )
+        else:
+            assert any(
+                isinstance(status, ops.BlockedStatus) and "Charm upgrade failed" in status.message
+                for status in ctx.unit_status_history
+            )
+            assert ("collectstatic", "--noinput") not in calls
+            assert not any(
+                call.args[0] == ["systemctl", "restart", "terrasquid-api"] for call in no_subprocess.call_args_list
+            )
 
 
 class TestDatabaseRelation:
@@ -180,6 +303,25 @@ class TestCollectUnitStatus:
         with ctx(ctx.on.collect_unit_status(), base_state) as mgr:
             mgr.run()
             assert isinstance(mgr.charm.unit.status, ops.ActiveStatus)
+
+    def test_certificates_without_hostname_blocks(self, ctx):
+        """A certificate relation requires an explicit hostname."""
+        relation = ops.testing.Relation("certificates")
+
+        state = ctx.run(ctx.on.collect_unit_status(), ops.testing.State(relations={relation}))
+
+        assert isinstance(state.unit_status, ops.BlockedStatus)
+        assert "external-hostname" in state.unit_status.message
+
+    def test_inactive_gunicorn_reports_maintenance(self, ctx, base_state):
+        """A configured database alone is insufficient to report a healthy API."""
+        with (
+            patch("charm.SquidAsAServiceCharm._database_url", return_value="postgresql://db/terrasquid"),
+            patch("charm.SquidAsAServiceCharm._gunicorn_running", return_value=False),
+        ):
+            state = ctx.run(ctx.on.collect_unit_status(), base_state)
+
+        assert state.unit_status == ops.MaintenanceStatus("Starting API service")
 
 
 class TestCOSAgentRelation:
@@ -246,6 +388,230 @@ class TestActions:
             mgr.run()
         mock_manage.assert_called_once_with("render_squid_config")
 
+    @pytest.mark.parametrize(
+        ("action", "params", "command", "output", "expected"),
+        [
+            (
+                "create-key",
+                {"name": "team-a"},
+                "create_api_key",
+                "key=abc=123\nprefix=abcd\n",
+                {"key": "abc=123", "prefix": "abcd"},
+            ),
+            (
+                "rotate-key",
+                {"name": "team-a"},
+                "rotate_api_key",
+                "notice\n key = replacement \n",
+                {"key": "replacement"},
+            ),
+            ("revoke-key", {"name": "team-a"}, "revoke_api_key", " revoked \n", {"result": "revoked"}),
+            ("list-keys", {}, "list_api_keys", " team-a \n", {"keys": "team-a"}),
+            ("reconfigure", {}, "render_squid_config", "", {"result": "Squid config applied successfully."}),
+        ],
+    )
+    def test_actions_return_command_results(self, action, params, command, output, expected, ctx, base_state):
+        """Actions expose parsed command results without losing embedded equals signs."""
+        with patch("charm.SquidAsAServiceCharm._run_manage_capture", return_value=(output, "")) as manage:
+            ctx.run(ctx.on.action(action, params=params), base_state)
+
+        args = ("--name", params["name"]) if "name" in params else ()
+        manage.assert_called_once_with(command, *args)
+        assert ctx.action_results == expected
+
+    @pytest.mark.parametrize(
+        ("action", "params"),
+        [
+            ("revoke-key", {"name": "team-a"}),
+            ("rotate-key", {"name": "team-a"}),
+            ("list-keys", {}),
+            ("reconfigure", {}),
+            ("createsuperuser", {"username": "admin"}),
+        ],
+    )
+    def test_actions_report_command_failures(self, action, params, ctx, base_state):
+        """Management command errors fail the action instead of returning success."""
+        with (
+            patch("charm.SquidAsAServiceCharm._run_manage_capture", return_value=("", "command failed")),
+            patch("charm.SquidAsAServiceCharm._django_env", return_value={}),
+            pytest.raises(ops.testing.ActionFailed, match="command failed"),
+        ):
+            ctx.run(ctx.on.action(action, params=params), base_state)
+
+    def test_createsuperuser_passes_generated_password_via_environment(self, ctx, base_state):
+        """Superuser credentials go through the environment rather than command arguments."""
+        with (
+            patch("charm.secrets.token_urlsafe", return_value="generated-password"),
+            patch("charm.SquidAsAServiceCharm._django_env", return_value={"EXISTING": "value"}),
+            patch("charm.SquidAsAServiceCharm._run_manage_capture", return_value=("created", "")) as manage,
+        ):
+            ctx.run(ctx.on.action("createsuperuser", params={"username": "admin"}), base_state)
+
+        manage.assert_called_once_with(
+            "createsuperuser",
+            "--noinput",
+            "--username",
+            "admin",
+            "--email",
+            "admin@example.com",
+            extra_env={"EXISTING": "value", "DJANGO_SUPERUSER_PASSWORD": "generated-password"},
+        )
+        assert ctx.action_results == {"result": "Superuser 'admin' created.", "password": "generated-password"}
+
+
+class TestSecretKey:
+    """Tests for durable application keys and upgrades from unit-local keys."""
+
+    @pytest.fixture(autouse=True)
+    def local_paths(self, ctx, tmp_path, monkeypatch):
+        """Keep legacy keys and rendered credentials inside the test directory."""
+        import charm as charm_module
+
+        monkeypatch.setattr(charm_module, "TERRASQUID_RUN_DIR", tmp_path)
+        monkeypatch.setattr(charm_module, "TERRASQUID_ENV_FILE", tmp_path / "terrasquid.env")
+        monkeypatch.setattr(charm_module.SquidAsAServiceCharm, "_write_systemd_units", MagicMock())
+
+    def test_upgrade_migrates_existing_key_unchanged(self, ctx, tmp_path):
+        """An upgrade must preserve the exact pre-existing key in an app secret."""
+        key_file = tmp_path / "secret_key"
+        key_file.write_text("existing-deployment-key\n")
+        peer = ops.testing.PeerRelation("squid-aaas-peers")
+        with patch("charm.secrets.token_hex") as generate:
+            state = ctx.run(ctx.on.upgrade_charm(), ops.testing.State(leader=True, relations={peer}))
+        secret = next(secret for secret in state.secrets if secret.label == "terrasquid-django")
+        assert secret.owner == "app"
+        assert secret.tracked_content == {"secret-key": "existing-deployment-key"}
+        assert state.get_relation(peer.id).local_app_data["django-secret-id"] == secret.id
+        assert not key_file.exists()
+        generate.assert_not_called()
+
+        state = ctx.run(ctx.on.upgrade_charm(), state)
+        assert state.get_secret(id=secret.id).tracked_content == {"secret-key": "existing-deployment-key"}
+        assert len(state.secrets) == 1
+
+    def test_upgrade_renders_migrated_key_before_migrations(self, ctx, tmp_path):
+        """Database migrations and services must use the preserved key on upgrade."""
+        (tmp_path / "secret_key").write_text("existing-key")
+        peer = ops.testing.PeerRelation("squid-aaas-peers")
+        with (
+            patch("charm.SquidAsAServiceCharm._database_url", return_value="postgresql://host/db"),
+            patch("charm.SquidAsAServiceCharm._sync_config_version_if_stale"),
+            patch("charm.SquidAsAServiceCharm._run_manage") as manage,
+        ):
+            ctx.run(ctx.on.upgrade_charm(), ops.testing.State(leader=True, relations={peer}))
+        assert "SECRET_KEY=existing-key\n" in (tmp_path / "terrasquid.env").read_text()
+        assert manage.call_args_list[0].args == ("migrate", "--noinput")
+        assert (tmp_path / "terrasquid.env").stat().st_mode & 0o777 == 0o640
+
+    def test_new_deployment_generates_only_one_application_key(self, ctx):
+        """Repeated leadership events must reuse the application-owned key."""
+        peer = ops.testing.PeerRelation("squid-aaas-peers")
+        with patch("charm.secrets.token_hex", return_value="generated-key") as generate:
+            state = ctx.run(ctx.on.leader_elected(), ops.testing.State(leader=True, relations={peer}))
+            state = ctx.run(ctx.on.leader_elected(), state)
+        generate.assert_called_once_with(50)
+        assert len(state.secrets) == 1
+        assert next(iter(state.secrets)).tracked_content == {"secret-key": "generated-key"}
+
+    def test_peer_join_publishes_secret_created_before_relation(self, ctx):
+        """Leaders must publish an existing secret when the peer relation becomes available."""
+        secret = ops.testing.Secret({"secret-key": "persisted-key"}, owner="app", label="terrasquid-django")
+        peer = ops.testing.PeerRelation("squid-aaas-peers", peers_data={1: {}})
+        state = ctx.run(
+            ctx.on.relation_joined(peer, remote_unit=1),
+            ops.testing.State(leader=True, secrets={secret}, relations={peer}),
+        )
+        assert state.get_relation(peer.id).local_app_data["django-secret-id"] == secret.id
+        assert len(state.secrets) == 1
+
+    @pytest.mark.parametrize("leader", [False, True])
+    def test_existing_secret_wins_over_local_file(self, leader, ctx, tmp_path):
+        """Replacement units and leaders must never overwrite the canonical key."""
+        (tmp_path / "secret_key").write_text("old-unit-specific-key")
+        secret = ops.testing.Secret({"secret-key": "canonical-key"}, owner="app", label="terrasquid-django")
+        peer = ops.testing.PeerRelation("squid-aaas-peers", local_app_data={"django-secret-id": secret.id})
+        with ctx(ctx.on.config_changed(), ops.testing.State(leader=leader, secrets={secret}, relations={peer})) as mgr:
+            assert mgr.charm._get_or_generate_secret_key() == "canonical-key"
+            assert not (tmp_path / "secret_key").exists()
+
+    def test_replacement_unit_reads_key_without_local_file(self, ctx, tmp_path):
+        """A fresh follower must reconstruct its environment from Juju alone."""
+        secret = ops.testing.Secret({"secret-key": "persisted-key"}, owner="app", label="terrasquid-django")
+        peer = ops.testing.PeerRelation("squid-aaas-peers", local_app_data={"django-secret-id": secret.id})
+        with (
+            patch("charm.SquidAsAServiceCharm._database_url", return_value="postgresql://host/db"),
+            patch("charm.SquidAsAServiceCharm._sync_config_version_if_stale"),
+        ):
+            state = ctx.run(ctx.on.start(), ops.testing.State(secrets={secret}, relations={peer}))
+        assert not state.deferred
+        assert "SECRET_KEY=persisted-key\n" in (tmp_path / "terrasquid.env").read_text()
+        assert not (tmp_path / "secret_key").exists()
+
+    @pytest.mark.parametrize("event_name", ["start", "upgrade_charm", "config_changed"])
+    def test_follower_waits_without_generating_or_discarding_key(self, event_name, ctx, tmp_path, no_subprocess):
+        """Followers must retain legacy keys and defer work until the leader publishes."""
+        key_file = tmp_path / "secret_key"
+        key_file.write_text("legacy-follower-key")
+        with (
+            patch("charm.SquidAsAServiceCharm._database_url", return_value="postgresql://host/db"),
+            patch("charm.secrets.token_hex") as generate,
+            patch("charm.SquidAsAServiceCharm._run_manage") as manage,
+        ):
+            state = ctx.run(getattr(ctx.on, event_name)(), ops.testing.State())
+        assert state.deferred
+        assert state.unit_status == ops.WaitingStatus("Waiting for leader to create application secret")
+        assert key_file.read_text() == "legacy-follower-key"
+        assert not (tmp_path / "terrasquid.env").exists()
+        generate.assert_not_called()
+        manage.assert_not_called()
+        assert not any("terrasquid-api" in call.args[0] for call in no_subprocess.call_args_list)
+
+    def test_failed_secret_creation_retains_local_key(self, ctx, tmp_path):
+        """The migration source must remain available when Juju rejects secret creation."""
+        key_file = tmp_path / "secret_key"
+        key_file.write_text("existing-key")
+        with (
+            ctx(ctx.on.config_changed(), ops.testing.State(leader=True)) as mgr,
+            patch.object(ops.Application, "add_secret", side_effect=ops.ModelError("secret store unavailable")),
+            pytest.raises(ops.ModelError, match="secret store unavailable"),
+        ):
+            mgr.charm._get_or_generate_secret_key()
+        assert key_file.read_text() == "existing-key"
+
+    def test_missing_published_secret_is_not_regenerated(self, ctx, tmp_path):
+        """A missing referenced secret must fail visibly rather than rotate credentials."""
+        peer = ops.testing.PeerRelation("squid-aaas-peers", local_app_data={"django-secret-id": "secret:missing"})
+        with (
+            ctx(ctx.on.config_changed(), ops.testing.State(leader=True, relations={peer})) as mgr,
+            pytest.raises(ops.SecretNotFoundError),
+        ):
+            mgr.charm._get_or_generate_secret_key()
+        assert not (tmp_path / "secret_key").exists()
+
+    def test_peer_event_replaces_follower_key_and_restarts_api(self, ctx, tmp_path, no_subprocess):
+        """Existing followers must adopt the leader's migrated key, even while running."""
+        env_file = tmp_path / "terrasquid.env"
+        env_file.write_text("SECRET_KEY=old-follower-key\n")
+        secret = ops.testing.Secret({"secret-key": "leader-key"}, owner="app", label="terrasquid-django")
+        peer = ops.testing.PeerRelation(
+            "squid-aaas-peers", local_app_data={"django-secret-id": secret.id}, peers_data={1: {}}
+        )
+        with (
+            patch("charm.SquidAsAServiceCharm._database_url", return_value="postgresql://host/db"),
+            patch("charm.SquidAsAServiceCharm._sync_config_version_if_stale"),
+        ):
+            state = ctx.run(
+                ctx.on.relation_changed(peer, remote_unit=1),
+                ops.testing.State(
+                    secrets={secret},
+                    relations={peer},
+                    unit_status=ops.WaitingStatus("Waiting for leader to create application secret"),
+                ),
+            )
+        assert "SECRET_KEY=leader-key\n" in env_file.read_text()
+        assert isinstance(state.unit_status, ops.ActiveStatus)
+        no_subprocess.assert_any_call(["systemctl", "restart", "terrasquid-api"], check=True)
+
 
 class TestEnvFile:
     """Tests for environment file generation."""
@@ -286,7 +652,6 @@ class TestEnvFile:
                 "squid-port": 3128,
                 "api-port": 8080,
                 "gunicorn-workers": 4,
-                "squid-extra-config": "",
                 "squid-pinned-config-version": 5,
             }
         )
