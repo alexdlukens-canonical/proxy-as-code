@@ -13,8 +13,35 @@ jobs:
       contents: read
     outputs:
       plan: ${{ steps.plan.outputs.plan }}
+      has-code-changes: ${{ steps.changes.outputs.has-code-changes }}
     steps:
       - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - name: Find publishable changes
+        id: changes
+        env:
+          BEFORE_SHA: ${{ github.event.before }}
+        run: |
+          if [[ "$GITHUB_EVENT_NAME" == "workflow_dispatch" ]]; then
+            echo "has-code-changes=true" >> "$GITHUB_OUTPUT"
+          else
+            changed_files="$(git diff --name-only "$BEFORE_SHA" "$GITHUB_SHA" -- . ':!*.md' ':!terraform*')"
+            if [[ -n "$changed_files" ]]; then
+              echo "has-code-changes=true" >> "$GITHUB_OUTPUT"
+            else
+              echo "has-code-changes=false" >> "$GITHUB_OUTPUT"
+            fi
+          fi
+      - name: Check Charmhub credentials
+        if: steps.changes.outputs.has-code-changes == 'true'
+        env:
+          CHARMHUB_TOKEN: ${{ secrets.CHARMHUB_TOKEN }}
+        run: |
+          if [[ -z "$CHARMHUB_TOKEN" ]]; then
+            echo "::error::Set the CHARMHUB_TOKEN Actions secret to credentials exported by charmcraft login --export."
+            exit 1
+          fi
       - uses: canonical/operator-workflows/internal/plan@main
         id: plan
         with:
@@ -49,14 +76,52 @@ jobs:
           github-token: ${{ secrets.GITHUB_TOKEN }}
 
   publish-to-edge:
-    needs: build
-    uses: canonical/operator-workflows/.github/workflows/publish_charm.yaml@main
+    needs: [plan, build]
+    if: needs.plan.outputs.has-code-changes == 'true'
+    runs-on: ubuntu-24.04
     permissions:
       actions: read
       contents: write
-    secrets: inherit
-    with:
-      channel: latest/edge
-      force-publish: ${{ github.event_name == 'workflow_dispatch' }}
-      workflow-run-id: ${{ github.run_id }}
-      working-directory: ./charm
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install charmcraft
+        run: sudo snap install charmcraft --channel latest/stable --classic
+      - uses: canonical/operator-workflows/internal/publish@main
+        id: publish
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          charmhub-token: ${{ secrets.CHARMHUB_TOKEN }}
+          plan: ${{ needs.plan.outputs.plan }}
+          run-id: ${{ github.run_id }}
+          working-directory: ./charm
+      - name: Add version file to charm
+        env:
+          CHARM_FILES: ${{ steps.publish.outputs.charms }}
+        run: |
+          sudo apt-get update && sudo apt-get install -y zip
+          version_dir="$(mktemp -d)"
+          echo "${GITHUB_SHA::8}" > "$version_dir/version"
+          IFS=',' read -ra charm_files <<< "$CHARM_FILES"
+          for charm_file in "${charm_files[@]}"; do
+            charm_file="$(echo "$charm_file" | xargs)"
+            if ! zipinfo -1 "$charm_file" | grep -qx "version"; then
+              (cd "$version_dir" && zip "$charm_file" version)
+            fi
+          done
+          rm "$version_dir/version"
+          rmdir "$version_dir"
+      - name: Upload charm to Charmhub
+        uses: canonical/charming-actions/upload-charm@2.7.0
+        with:
+          built-charm-path: ${{ steps.publish.outputs.charms }}
+          charm-path: ./charm
+          credentials: ${{ secrets.CHARMHUB_TOKEN }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          channel: latest/edge
+          upload-image: false
+      - name: Release charm libraries
+        uses: canonical/charming-actions/release-libraries@2.7.0
+        with:
+          credentials: ${{ secrets.CHARMHUB_TOKEN }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          charm-path: ./charm
