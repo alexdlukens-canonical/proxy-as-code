@@ -200,7 +200,9 @@ class SquidAsAServiceCharm(ops.CharmBase):
         if not self._gunicorn_running():
             event.add_status(ops.MaintenanceStatus("Starting API service"))
             return
-        self._sync_config_version_if_stale()
+        if not self._sync_config_version_if_stale():
+            event.add_status(ops.BlockedStatus("Failed to reconcile Squid configuration"))
+            return
         api_status = "up"
         squid_status = "up" if squid.squid_service_running() else "down"
         config_version = self._read_applied_config_version()
@@ -543,7 +545,7 @@ class SquidAsAServiceCharm(ops.CharmBase):
         subprocess.run(cmd, check=True, env=self._django_env(), cwd=str(DJANGO_APP_DIR))
 
     def _run_manage_capture(self, *args: str, extra_env: dict | None = None) -> tuple[str, str]:
-        """Run a Django management command and return (stdout, stderr)."""
+        """Return (stdout, error), with a nonempty error when the management command fails."""
         cmd = [str(VENV_BIN / "python"), str(DJANGO_APP_DIR / "manage.py"), *args]
         env = self._django_env()
         if extra_env:
@@ -556,7 +558,11 @@ class SquidAsAServiceCharm(ops.CharmBase):
             cwd=str(DJANGO_APP_DIR),
         )
         if result.returncode != 0:
-            return "", result.stderr.strip() or result.stdout.strip()
+            return "", (
+                result.stderr.strip()
+                or result.stdout.strip()
+                or f"Management command failed with exit code {result.returncode}"
+            )
         return result.stdout, ""
 
     def _write_gunicorn_config(self) -> None:
@@ -784,25 +790,25 @@ class SquidAsAServiceCharm(ops.CharmBase):
             return True
         return rel.data[self.app].get("db-migrated") == "true"
 
-    def _sync_config_version_if_stale(self) -> None:
+    def _sync_config_version_if_stale(self) -> bool:
         """Re-render the Squid config and bump ConfigVersion if DB state diverges from the stored render."""
         if not self.unit.is_leader():
-            return
+            return True
         out, err = self._run_manage_capture(
             "shell",
             "-c",
             (
-                "from terrasquid.api.models import ConfigVersion;"
-                "from terrasquid.api.squid_render import render_squid_config;"
-                "cv = ConfigVersion.get();"
-                "rendered = render_squid_config(version=cv.version);"
-                "changed = cv.rendered_config != rendered;"
-                "changed and ConfigVersion.increment(render_squid_config());"
+                "from terrasquid.api.policy import reconcile_policy;"
+                "changed = reconcile_policy();"
                 "print('stale' if changed else 'ok')"
             ),
         )
+        if err:
+            logger.error("Failed to reconcile Squid configuration: %s", err)
+            return False
         if out.strip() == "stale":
             logger.info("Config version bumped: DB state diverged from stored render (e.g. admin edit)")
+        return True
 
     def _read_applied_config_version(self) -> int:
         if not TERRASQUID_STATUS_FILE.exists():

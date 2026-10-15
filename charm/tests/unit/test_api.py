@@ -843,9 +843,9 @@ class TestSquidConfigValidation(TestCase):
     def test_squid_validation_failure_returns_422(self) -> None:
         """When Squid config validation fails, the API returns 422 and rolls back."""
         with (
-            patch("terrasquid.api.views.render_squid_config", return_value="bad config"),
+            patch("terrasquid.api.policy.render_squid_config", return_value="bad config"),
             patch(
-                "terrasquid.api.views.validate_squid_config",
+                "terrasquid.api.policy.validate_squid_config",
                 return_value=(False, "syntax error"),
             ),
         ):
@@ -861,9 +861,9 @@ class TestSquidConfigValidation(TestCase):
         from terrasquid.api.models import SourceACL
 
         with (
-            patch("terrasquid.api.views.render_squid_config", return_value="bad"),
+            patch("terrasquid.api.policy.render_squid_config", return_value="bad"),
             patch(
-                "terrasquid.api.views.validate_squid_config",
+                "terrasquid.api.policy.validate_squid_config",
                 return_value=(False, "error"),
             ),
         ):
@@ -885,14 +885,26 @@ class TestConfigVersionHistory(TestCase):
         ConfigVersion.increment("# config v1")
         assert RenderedConfigHistory.objects.filter(version=1, rendered_config="# config v1").exists()
 
-    def test_increment_updates_history_for_same_version(self) -> None:
-        """Calling increment twice updates the history entry for each version."""
+    def test_increment_creates_distinct_history_versions(self) -> None:
+        """Calling increment twice preserves separate immutable history entries."""
         from terrasquid.api.models import ConfigVersion, RenderedConfigHistory
 
         ConfigVersion.increment("# config v1")
         ConfigVersion.increment("# config v2")
         assert RenderedConfigHistory.objects.count() == 2
         assert RenderedConfigHistory.objects.get(version=2).rendered_config == "# config v2"
+
+    def test_duplicate_history_version_rolls_back_increment(self) -> None:
+        """A conflicting history entry must not be overwritten or advance the version."""
+        from django.db import IntegrityError
+        from terrasquid.api.models import ConfigVersion, RenderedConfigHistory
+
+        RenderedConfigHistory.objects.create(version=1, rendered_config="# original")
+        with self.assertRaises(IntegrityError):
+            ConfigVersion.increment("# replacement")
+
+        assert ConfigVersion.get().version == 0
+        assert RenderedConfigHistory.objects.get(version=1).rendered_config == "# original"
 
     @override_settings(SQUID_PINNED_CONFIG_VERSION=7)
     def test_increment_prunes_history_without_removing_active_pin(self) -> None:

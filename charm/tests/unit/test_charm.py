@@ -87,6 +87,85 @@ class TestStart:
         assert any("terrasquid-squid-exporter" in s for s in started)
 
 
+class TestManagementCommands:
+    """Tests for captured management-command results."""
+
+    @pytest.mark.parametrize(
+        ("returncode", "stdout", "stderr", "expected"),
+        [
+            (0, "ok\n", "warning\n", ("ok\n", "")),
+            (1, "stdout error\n", "stderr error\n", ("", "stderr error")),
+            (1, "stdout error\n", "", ("", "stdout error")),
+            (1, "", "", ("", "Management command failed with exit code 1")),
+            (-9, "", "", ("", "Management command failed with exit code -9")),
+            (1, " \n", "\n", ("", "Management command failed with exit code 1")),
+        ],
+    )
+    def test_captured_result(self, returncode, stdout, stderr, expected, no_subprocess, ctx):
+        """Failures always return an error, preferring captured diagnostics."""
+        from charm import SquidAsAServiceCharm
+
+        no_subprocess.return_value = subprocess.CompletedProcess(
+            args=["python", "manage.py", "shell"], returncode=returncode, stdout=stdout, stderr=stderr
+        )
+
+        assert SquidAsAServiceCharm._run_manage_capture(MagicMock(), "shell", "-c", "pass") == expected
+
+
+class TestPolicyReconciliation:
+    """Tests for the charm's serialized configuration publication path."""
+
+    def test_reconciliation_uses_shared_policy_helper(self, ctx):
+        """Leader reconciliation must use the same lock and validation as API writes."""
+        from charm import SquidAsAServiceCharm
+
+        charm = MagicMock()
+        charm.unit.is_leader.return_value = True
+        charm._run_manage_capture.return_value = ("stale", "")
+        assert SquidAsAServiceCharm._sync_config_version_if_stale(charm)
+        command = charm._run_manage_capture.call_args.args
+        assert command[:2] == ("shell", "-c")
+        assert "reconcile_policy()" in command[2]
+        assert "ConfigVersion.increment" not in command[2]
+
+    def test_reconciliation_failure_is_reported(self, ctx, caplog):
+        """A failed reconciliation must not look like a successful status check."""
+        from charm import SquidAsAServiceCharm
+
+        charm = MagicMock()
+        charm.unit.is_leader.return_value = True
+        charm._run_manage_capture.return_value = ("", "Squid configuration validation failed")
+        assert not SquidAsAServiceCharm._sync_config_version_if_stale(charm)
+        assert "Failed to reconcile Squid configuration" in caplog.text
+
+    @pytest.mark.parametrize("returncode", [1, -9])
+    def test_silent_command_failure_is_reported(self, returncode, no_subprocess, ctx, caplog):
+        """A command failing without output must not make reconciliation succeed."""
+        from charm import SquidAsAServiceCharm
+
+        no_subprocess.return_value = subprocess.CompletedProcess(
+            args=["python", "manage.py", "shell"], returncode=returncode, stdout="", stderr=""
+        )
+        charm = MagicMock()
+        charm.unit.is_leader.return_value = True
+        charm._run_manage_capture.return_value = SquidAsAServiceCharm._run_manage_capture(charm, "shell", "-c", "pass")
+
+        assert not SquidAsAServiceCharm._sync_config_version_if_stale(charm)
+        assert f"exit code {returncode}" in caplog.text
+
+    def test_collect_status_blocks_on_reconciliation_failure(self, ctx):
+        """Collect-status must preserve an explicit reconciliation error."""
+        from charm import SquidAsAServiceCharm
+
+        charm = MagicMock()
+        charm.model.relations = {}
+        charm.unit.status = ops.ActiveStatus()
+        charm._sync_config_version_if_stale.return_value = False
+        event = MagicMock()
+        SquidAsAServiceCharm._on_collect_unit_status(charm, event)
+        event.add_status.assert_called_once_with(ops.BlockedStatus("Failed to reconcile Squid configuration"))
+
+
 class TestWatcherTimer:
     """Tests for the Squid configuration watcher timer."""
 

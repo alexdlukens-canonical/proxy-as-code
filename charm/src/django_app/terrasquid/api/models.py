@@ -2,10 +2,13 @@
 
 import ipaddress
 import uuid
+from collections.abc import Iterator
+from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
 
 from django.conf import settings
-from django.db import models
+from django.db import models, transaction
+from django.db.models import F
 from django.utils import timezone
 
 NAME_PATTERN = r"^[a-zA-Z0-9_-]+$"
@@ -171,18 +174,26 @@ class ConfigVersion(models.Model):
         return obj
 
     @classmethod
+    @contextmanager
+    def locked(cls) -> Iterator["ConfigVersion"]:
+        """Serialize policy reads, writes, and publication until transaction completion."""
+        with transaction.atomic():
+            cls.get()
+            yield cls.objects.select_for_update().get(pk=1)
+
+    @classmethod
     def increment(cls, rendered_config: str) -> "ConfigVersion":
         """Bump the version counter, store the new rendered config, and save to history."""
-        obj = cls.get()
-        obj.version += 1
-        obj.rendered_config = rendered_config
-        obj.save()
-        RenderedConfigHistory.objects.update_or_create(
-            version=obj.version,
-            defaults={"rendered_config": rendered_config},
-        )
-        RenderedConfigHistory.prune(pinned_version=settings.SQUID_PINNED_CONFIG_VERSION)
-        return obj
+        with cls.locked() as obj:
+            cls.objects.filter(pk=1).update(
+                version=F("version") + 1,
+                rendered_config=rendered_config,
+                updated_at=timezone.now(),
+            )
+            obj.refresh_from_db()
+            RenderedConfigHistory.objects.create(version=obj.version, rendered_config=rendered_config)
+            RenderedConfigHistory.prune(pinned_version=settings.SQUID_PINNED_CONFIG_VERSION)
+            return obj
 
 
 class RenderedConfigHistory(models.Model):
