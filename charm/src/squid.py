@@ -13,8 +13,8 @@ SQUID_SPOOL_DIR = Path("/var/spool/squid")
 
 
 def install_squid() -> None:
-    """Install Squid and its Prometheus exporter via apt."""
-    subprocess.run(["apt-get", "install", "-y", "squid", "prometheus-squid-exporter"], check=True)
+    """Install Squid, its Prometheus exporter, and log rotation support."""
+    subprocess.run(["apt-get", "install", "-y", "squid", "prometheus-squid-exporter", "logrotate"], check=True)
 
 
 def write_squid_config(config_text: str, path: Path = SQUID_CONF_PATH) -> None:

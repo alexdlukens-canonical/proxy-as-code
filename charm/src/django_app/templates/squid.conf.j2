@@ -4,6 +4,9 @@
 
 http_port [::]:{{ squid_port }}
 coredump_dir /var/spool/squid
+access_log daemon:/var/log/squid/access.log squid
+cache_log /var/log/squid/cache.log
+logfile_rotate 0
 
 # Cache-manager statistics are available only to the local exporter.
 acl manager proto cache_object
