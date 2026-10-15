@@ -213,6 +213,92 @@ class TestDestinationConfigEndpoints(TestCase):
         assert data["dst"] == "archive.ubuntu.com"
         assert data["type"] == "ALLOW"
         assert data["comment"] == "Ubuntu package mirror"
+        assert data["port_ranges"] is None
+
+    def test_port_ranges_crud(self) -> None:
+        """Ranges round-trip alongside ports and can be replaced, cleared, or unset."""
+        with patch("terrasquid.api.squid_render.validate_squid_config", return_value=(True, "")):
+            response = self.client.post(
+                "/api/v1/destinations/",
+                {
+                    "name": "nodeports",
+                    "dst": "example.com",
+                    "type": "ALLOW",
+                    "ports": [1, 443, 65535],
+                    "port_ranges": ["1-1", "30000-32767", "65535-65535"],
+                },
+                format="json",
+            )
+            assert response.status_code == 201, response.json()
+            data = response.json()
+            assert data["ports"] == [1, 443, 65535]
+            assert data["port_ranges"] == ["1-1", "30000-32767", "65535-65535"]
+            url = f"/api/v1/destinations/{data['id']}/"
+            assert self.client.get(url).json()["port_ranges"] == data["port_ranges"]
+            assert self.client.get("/api/v1/destinations/").json()[0]["port_ranges"] == data["port_ranges"]
+            response = self.client.patch(url, {"comment": "Keep ranges"}, format="json")
+            assert response.status_code == 200
+            assert response.json()["port_ranges"] == data["port_ranges"]
+            for ranges in (["8080-8090"], [], None):
+                response = self.client.put(
+                    url,
+                    {"name": "nodeports", "dst": "example.com", "type": "CONNECT", "port_ranges": ranges},
+                    format="json",
+                )
+                assert response.status_code == 200, response.json()
+                assert response.json()["port_ranges"] == ranges
+
+    def test_invalid_port_restrictions(self) -> None:
+        """Reject invalid types, endpoints, ordering, and configuration injection."""
+        invalid_values = {
+            "ports": [[0], [65536], [-1], [True], ["30000-32767"], [80.5], "443", {}],
+            "port_ranges": [
+                ["0-80"],
+                ["80-65536"],
+                ["443-80"],
+                ["-1-80"],
+                ["80"],
+                ["80-90-100"],
+                [" 80-90"],
+                ["80-90 "],
+                ["80-90\n"],
+                ["80-90\nhttp_access allow all"],
+                ["８０-９０"],
+                [80],
+                [None],
+                "80-90",
+                {},
+            ],
+        }
+        for field, values in invalid_values.items():
+            for value in values:
+                with self.subTest(field=field, value=value):
+                    response = self.client.post(
+                        "/api/v1/destinations/",
+                        {"name": "invalid", "dst": "example.com", "type": "ALLOW", field: value},
+                        format="json",
+                    )
+                    assert response.status_code == 400, response.json()
+                    assert field in response.json()
+
+    def test_invalid_port_range_update_preserves_destination(self) -> None:
+        """Failed updates cannot change previously valid restrictions."""
+        from terrasquid.api.models import DestinationConfig
+
+        destination = DestinationConfig.objects.create(
+            service="test-service",
+            key_prefix=self.api_key.prefix,
+            name="existing",
+            dst="example.com",
+            type="ALLOW",
+            port_ranges=["30000-32767"],
+        )
+        response = self.client.patch(
+            f"/api/v1/destinations/{destination.id}/", {"port_ranges": ["65535-1"]}, format="json"
+        )
+        assert response.status_code == 400
+        destination.refresh_from_db()
+        assert destination.port_ranges == ["30000-32767"]
 
     def test_delete_referenced_destination_returns_409(self) -> None:
         """DELETE on a destination referenced by an ACL rule should return 409."""

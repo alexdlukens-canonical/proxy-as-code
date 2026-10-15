@@ -653,7 +653,21 @@ components:
         type:
           $ref: '#/components/schemas/TypeEnum'
         ports:
+          type: array
+          items:
+            type: integer
+            maximum: 65535
+            minimum: 1
           nullable: true
+        port_ranges:
+          type: array
+          items:
+            type: string
+            pattern: ^[0-9]{1,5}-[0-9]{1,5}$
+          nullable: true
+          description: Inclusive start-end ranges with endpoints between 1 and 65535
+            and start <= end. Combined with ports; defaults apply only when both lists
+            are empty or unset.
         comment:
           type: string
           maxLength: 255
@@ -738,7 +752,21 @@ components:
         type:
           $ref: '#/components/schemas/TypeEnum'
         ports:
+          type: array
+          items:
+            type: integer
+            maximum: 65535
+            minimum: 1
           nullable: true
+        port_ranges:
+          type: array
+          items:
+            type: string
+            pattern: ^[0-9]{1,5}-[0-9]{1,5}$
+          nullable: true
+          description: Inclusive start-end ranges with endpoints between 1 and 65535
+            and start <= end. Combined with ports; defaults apply only when both lists
+            are empty or unset.
         comment:
           type: string
           maxLength: 255

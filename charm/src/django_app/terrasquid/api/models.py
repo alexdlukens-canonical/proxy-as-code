@@ -11,8 +11,19 @@ from django.db import models, transaction
 from django.db.models import F
 from django.utils import timezone
 
+from .validators import validate_port_ranges, validate_ports
+
 NAME_PATTERN = r"^[a-zA-Z0-9_-]+$"
 SERVICE_PATTERN = r"^[a-zA-Z0-9_-]+$"
+
+
+def port_sort_key(ports: tuple[int | str, ...]) -> tuple[tuple[int, int, str], ...]:
+    """Compare port tokens numerically without mixing integers and range strings."""
+    result = []
+    for port in ports:
+        endpoints = str(port).split("-")
+        result.append((int(endpoints[0]), int(endpoints[-1]), str(port)))
+    return tuple(result)
 
 
 class BaseResource(models.Model):
@@ -53,7 +64,8 @@ class DestinationConfig(BaseResource):
 
     dst = models.TextField()
     type = models.CharField(max_length=10, choices=ActionType.choices)
-    ports = models.JSONField(default=list, null=True, blank=True)
+    ports = models.JSONField(default=list, null=True, blank=True, validators=[validate_ports])
+    port_ranges = models.JSONField(default=None, null=True, blank=True, validators=[validate_port_ranges])
     comment = models.CharField(max_length=255, blank=True, default="")
 
     class Meta:
@@ -72,12 +84,13 @@ class DestinationConfig(BaseResource):
         except ValueError:
             return False
 
-    def effective_ports(self) -> list[int]:
-        """Return the configured ports, defaulting by action type when none are set."""
+    def effective_ports(self) -> list[int | str]:
+        """Combine ports and ranges, defaulting by action type only when both are empty."""
         result: set[int] = set(self.ports or [])
-        if not result:
+        ranges = sorted(set(self.port_ranges or []))
+        if not result and not ranges:
             result = {443} if self.type == self.ActionType.CONNECT else {80}
-        return sorted(result)
+        return [*sorted(result), *ranges]
 
 
 class DestinationGroup(BaseResource):
@@ -122,7 +135,7 @@ class ACLRule(BaseResource):
     @property
     def effective_destination_buckets(self) -> list[dict]:
         """Return effective destinations partitioned into safe Squid access-list buckets."""
-        buckets: dict[tuple[str, tuple[int, ...], str], list[DestinationConfig]] = {}
+        buckets: dict[tuple[str, tuple[int | str, ...], str], list[DestinationConfig]] = {}
         for destination in self.effective_destinations:
             destination_kind = "dst" if destination.is_cidr else "dstdomain"
             key = (destination.type, tuple(destination.effective_ports()), destination_kind)
@@ -137,7 +150,8 @@ class ACLRule(BaseResource):
                 "destinations": sorted(destinations, key=lambda destination: destination.dst),
             }
             for index, ((action_type, ports, destination_kind), destinations) in enumerate(
-                sorted(buckets.items()), start=1
+                sorted(buckets.items(), key=lambda item: (item[0][0], port_sort_key(item[0][1]), item[0][2])),
+                start=1,
             )
         ]
 

@@ -9,6 +9,8 @@ from django.db.models import Prefetch
 from jinja2 import Environment, FileSystemLoader
 from opentelemetry import trace
 
+from .models import port_sort_key
+
 tracer = trace.get_tracer(__name__)
 
 # Squid reads physical lines into an 8192-byte buffer, including newline and NUL.
@@ -74,7 +76,10 @@ def _build_acl_render_plan(acl_rules: list) -> tuple[list[dict], list[dict]]:
             grouped_destinations.setdefault(key, {})[destination.id] = destination
 
         buckets = []
-        for index, (key, destinations_by_id) in enumerate(sorted(grouped_destinations.items()), start=1):
+        for index, (key, destinations_by_id) in enumerate(
+            sorted(grouped_destinations.items(), key=lambda item: (item[0][0], port_sort_key(item[0][1]))),
+            start=1,
+        ):
             destinations = sorted(
                 destinations_by_id.values(),
                 key=lambda item: (item.service, item.name),
@@ -110,7 +115,10 @@ def _build_acl_render_plan(acl_rules: list) -> tuple[list[dict], list[dict]]:
             references_by_key.setdefault(key, []).append(_destination_acl_name(destination))
 
         buckets = []
-        for index, ((action_type, ports), acl_names) in enumerate(sorted(references_by_key.items()), start=1):
+        for index, ((action_type, ports), acl_names) in enumerate(
+            sorted(references_by_key.items(), key=lambda item: (item[0][0], port_sort_key(item[0][1]))),
+            start=1,
+        ):
             destination_acl_names = sorted(set(acl_names))
             buckets.append(
                 {
@@ -157,7 +165,9 @@ def render_squid_config(version: int | None = None) -> str:
         ).order_by("priority", "created_at", "service", "name")
     )
     destination_group_entries, rule_entries = _build_acl_render_plan(acl_rules)
-    port_sets = sorted({tuple(bucket["ports"]) for entry in rule_entries for bucket in entry["buckets"]})
+    port_sets = sorted(
+        {tuple(bucket["ports"]) for entry in rule_entries for bucket in entry["buckets"]}, key=port_sort_key
+    )
     action_order = {"DENY": 0, "CONNECT": 1, "ALLOW": 2}
     acl_access_entries = sorted(
         (
