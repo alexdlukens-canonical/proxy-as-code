@@ -1,6 +1,7 @@
 """Unit tests for the SquidAsAServiceCharm ops lifecycle."""
 
 import json
+import subprocess
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -125,6 +126,50 @@ class TestUpgrade:
         config = json.loads(state.get_relation(relation.id).local_unit_data["config"])
         assert config["tracing_protocols"] == ["otlp_http"]
 
+    @pytest.mark.parametrize(
+        ("leader", "migrated", "fails"),
+        [(True, False, False), (True, True, True), (False, True, False), (False, False, False)],
+    )
+    def test_upgrade_coordinates_migrations(self, leader, migrated, fails, ctx, base_state, no_subprocess):
+        """Only leaders migrate; followers defer until the migration flag is set."""
+        peer = ops.testing.PeerRelation("squid-aaas-peers", local_app_data={"db-migrated": "true" if migrated else ""})
+        state = ops.testing.State(config=base_state.config, leader=leader, relations={peer})
+        failure = subprocess.CalledProcessError(1, "migrate") if fails else None
+        with (
+            patch("charm.SquidAsAServiceCharm._write_systemd_units"),
+            patch("charm.SquidAsAServiceCharm._write_env_file"),
+            patch("charm.SquidAsAServiceCharm._database_url", return_value="postgresql://db/terrasquid"),
+            patch("charm.SquidAsAServiceCharm._sync_config_version_if_stale"),
+            patch("charm.SquidAsAServiceCharm._run_manage", side_effect=failure) as manage,
+        ):
+            result = ctx.run(ctx.on.upgrade_charm(), state)
+
+        calls = [call.args for call in manage.call_args_list]
+        if leader:
+            assert calls[0] == ("migrate", "--noinput")
+            assert result.get_relation(peer.id).local_app_data.get("db-migrated", "") == ("" if fails else "true")
+        else:
+            assert ("migrate", "--noinput") not in calls
+        if not leader and not migrated:
+            assert result.deferred
+            manage.assert_not_called()
+        elif not fails:
+            assert calls[-1] == ("collectstatic", "--noinput")
+            assert not result.deferred
+            assert any(
+                call.args[0] == ["systemctl", "restart", "terrasquid-api"] for call in no_subprocess.call_args_list
+            )
+        else:
+            assert any(
+                isinstance(status, ops.BlockedStatus) and "Charm upgrade failed" in status.message
+                for status in ctx.unit_status_history
+            )
+            assert ("collectstatic", "--noinput") not in calls
+            assert not any(
+                call.args[0] == ["systemctl", "restart", "terrasquid-api"]
+                for call in no_subprocess.call_args_list
+            )
+
 
 class TestDatabaseRelation:
     """Tests for database relation lifecycle."""
@@ -179,6 +224,25 @@ class TestCollectUnitStatus:
         with ctx(ctx.on.collect_unit_status(), base_state) as mgr:
             mgr.run()
             assert isinstance(mgr.charm.unit.status, ops.ActiveStatus)
+
+    def test_certificates_without_hostname_blocks(self, ctx):
+        """A certificate relation requires an explicit hostname."""
+        relation = ops.testing.Relation("certificates")
+
+        state = ctx.run(ctx.on.collect_unit_status(), ops.testing.State(relations={relation}))
+
+        assert isinstance(state.unit_status, ops.BlockedStatus)
+        assert "external-hostname" in state.unit_status.message
+
+    def test_inactive_gunicorn_reports_maintenance(self, ctx, base_state):
+        """A configured database alone is insufficient to report a healthy API."""
+        with (
+            patch("charm.SquidAsAServiceCharm._database_url", return_value="postgresql://db/terrasquid"),
+            patch("charm.SquidAsAServiceCharm._gunicorn_running", return_value=False),
+        ):
+            state = ctx.run(ctx.on.collect_unit_status(), base_state)
+
+        assert state.unit_status == ops.MaintenanceStatus("Starting API service")
 
 
 class TestCOSAgentRelation:
@@ -244,6 +308,76 @@ class TestActions:
         with ctx(ctx.on.action("reconfigure"), base_state) as mgr:
             mgr.run()
         mock_manage.assert_called_once_with("render_squid_config")
+
+    @pytest.mark.parametrize(
+        ("action", "params", "command", "output", "expected"),
+        [
+            (
+                "create-key",
+                {"name": "team-a"},
+                "create_api_key",
+                "key=abc=123\nprefix=abcd\n",
+                {"key": "abc=123", "prefix": "abcd"},
+            ),
+            (
+                "rotate-key",
+                {"name": "team-a"},
+                "rotate_api_key",
+                "notice\n key = replacement \n",
+                {"key": "replacement"},
+            ),
+            ("revoke-key", {"name": "team-a"}, "revoke_api_key", " revoked \n", {"result": "revoked"}),
+            ("list-keys", {}, "list_api_keys", " team-a \n", {"keys": "team-a"}),
+            ("reconfigure", {}, "render_squid_config", "", {"result": "Squid config applied successfully."}),
+        ],
+    )
+    def test_actions_return_command_results(self, action, params, command, output, expected, ctx, base_state):
+        """Actions expose parsed command results without losing embedded equals signs."""
+        with patch("charm.SquidAsAServiceCharm._run_manage_capture", return_value=(output, "")) as manage:
+            ctx.run(ctx.on.action(action, params=params), base_state)
+
+        args = ("--name", params["name"]) if "name" in params else ()
+        manage.assert_called_once_with(command, *args)
+        assert ctx.action_results == expected
+
+    @pytest.mark.parametrize(
+        ("action", "params"),
+        [
+            ("revoke-key", {"name": "team-a"}),
+            ("rotate-key", {"name": "team-a"}),
+            ("list-keys", {}),
+            ("reconfigure", {}),
+            ("createsuperuser", {"username": "admin"}),
+        ],
+    )
+    def test_actions_report_command_failures(self, action, params, ctx, base_state):
+        """Management command errors fail the action instead of returning success."""
+        with (
+            patch("charm.SquidAsAServiceCharm._run_manage_capture", return_value=("", "command failed")),
+            patch("charm.SquidAsAServiceCharm._django_env", return_value={}),
+            pytest.raises(ops.testing.ActionFailed, match="command failed"),
+        ):
+            ctx.run(ctx.on.action(action, params=params), base_state)
+
+    def test_createsuperuser_passes_generated_password_via_environment(self, ctx, base_state):
+        """Superuser credentials go through the environment rather than command arguments."""
+        with (
+            patch("charm.secrets.token_urlsafe", return_value="generated-password"),
+            patch("charm.SquidAsAServiceCharm._django_env", return_value={"EXISTING": "value"}),
+            patch("charm.SquidAsAServiceCharm._run_manage_capture", return_value=("created", "")) as manage,
+        ):
+            ctx.run(ctx.on.action("createsuperuser", params={"username": "admin"}), base_state)
+
+        manage.assert_called_once_with(
+            "createsuperuser",
+            "--noinput",
+            "--username",
+            "admin",
+            "--email",
+            "admin@example.com",
+            extra_env={"EXISTING": "value", "DJANGO_SUPERUSER_PASSWORD": "generated-password"},
+        )
+        assert ctx.action_results == {"result": "Superuser 'admin' created.", "password": "generated-password"}
 
 
 class TestEnvFile:
