@@ -45,6 +45,27 @@ MIDDLEWARE = [
     "django_prometheus.middleware.PrometheusAfterMiddleware",
 ]
 
+LOGGING = {
+    "version": 1,
+    "disable_existing_loggers": False,
+    "filters": {"trace_context": {"()": "terrasquid.telemetry.TraceContextFilter"}},
+    "formatters": {
+        "standard": {
+            "format": "{asctime} {levelname} {name} trace_id={trace_id} span_id={span_id} {message}",
+            "style": "{",
+        }
+    },
+    "handlers": {
+        "console": {
+            "class": "logging.StreamHandler",
+            "formatter": "standard",
+            "filters": ["trace_context"],
+        }
+    },
+    "root": {"handlers": ["console"], "level": "INFO"},
+    "loggers": {"django": {"handlers": ["console"], "level": "INFO", "propagate": False}},
+}
+
 ROOT_URLCONF = "terrasquid.urls"
 
 TEMPLATES = [

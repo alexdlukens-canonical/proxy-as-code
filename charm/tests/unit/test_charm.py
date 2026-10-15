@@ -117,6 +117,15 @@ class TestUpgrade:
         mock_install.assert_called_once()
         mock_units.assert_called_once()
 
+    @patch("charm.SquidAsAServiceCharm._write_systemd_units")
+    @patch("charm.squid.install_squid")
+    def test_upgrade_requests_tracing_on_existing_cos_relation(self, mock_install, mock_units, ctx):
+        """Upgrades must request the receiver even before another config-changed event."""
+        relation = ops.testing.Relation("cos-agent", remote_app_name="opentelemetry-collector")
+        state = ctx.run(ctx.on.upgrade_charm(), ops.testing.State(relations={relation}))
+        config = json.loads(state.get_relation(relation.id).local_unit_data["config"])
+        assert config["tracing_protocols"] == ["otlp_http"]
+
 
 class TestDatabaseRelation:
     """Tests for database relation lifecycle."""
@@ -193,6 +202,7 @@ class TestCOSAgentRelation:
         dashboards = [json.loads(LZMABase64.decompress(dashboard)) for dashboard in data["dashboards"]]
         assert {dashboard["title"] for dashboard in dashboards} == {"Terrasquid Overview", "Squid Metrics"}
         assert data["metrics_alert_rules"]["groups"]
+        assert data["tracing_protocols"] == ["otlp_http"]
 
     def test_dashboard_uses_native_squid_exporter_metrics(self):
         """The published Squid dashboard must graph metrics exported by the local exporter."""
@@ -454,3 +464,115 @@ class TestGunicornConfig:
         content = (tmp_path / "gunicorn.conf.py").read_text()
         assert "certfile" not in content
         assert "keyfile" not in content
+
+
+class TestWorkloadObservability:
+    """Tests for scrapeable logs and optional workload tracing."""
+
+    @pytest.mark.parametrize(
+        ("receivers", "expected"),
+        [
+            ([], ""),
+            (
+                [{"protocol": {"name": "otlp_http", "type": "http"}, "url": "http://collector:4318"}],
+                "http://collector:4318/v1/traces",
+            ),
+            (
+                [{"protocol": {"name": "otlp_http", "type": "http"}, "url": "https://collector:4318/v1/traces"}],
+                "https://collector:4318/v1/traces",
+            ),
+        ],
+    )
+    def test_receiver_change_updates_environment(self, receivers, expected, ctx, tmp_path, monkeypatch, no_subprocess):
+        """Receiver changes must refresh the master's environment, including on non-leader units."""
+        import charm as charm_module
+
+        env_file = tmp_path / "terrasquid.env"
+        monkeypatch.setattr(charm_module, "TERRASQUID_ENV_FILE", env_file)
+        monkeypatch.setattr(charm_module.SquidAsAServiceCharm, "_database_url", lambda _self: "postgresql://host/db")
+        monkeypatch.setattr(charm_module.SquidAsAServiceCharm, "_get_or_generate_secret_key", lambda _self: "test-key")
+        relation = ops.testing.Relation(
+            "cos-agent",
+            remote_app_name="opentelemetry-collector",
+            remote_units_data={0: {"receivers": json.dumps(receivers)}},
+        )
+        state = ctx.run(ctx.on.relation_joined(relation), ops.testing.State(relations={relation}))
+        state = ctx.run(ctx.on.relation_changed(state.get_relation(relation.id)), state)
+        content = env_file.read_text()
+        assert f"OTEL_EXPORTER_OTLP_TRACES_ENDPOINT={expected}\n" in content
+        assert "OTEL_SERVICE_NAME=terrasquid\n" in content
+        assert "OTEL_EXPORTER_OTLP_TRACES_CERTIFICATE=/etc/ssl/certs/ca-certificates.crt\n" in content
+        assert "juju_unit=terrasquid/0" in content
+        no_subprocess.assert_any_call(["systemctl", "restart", "terrasquid-api"], check=True)
+
+        no_subprocess.reset_mock()
+        ctx.run(ctx.on.relation_changed(state.get_relation(relation.id)), state)
+        assert not any(
+            call.args[0] == ["systemctl", "restart", "terrasquid-api"] for call in no_subprocess.call_args_list
+        )
+
+    @pytest.mark.parametrize("event_name", ["relation_departed", "relation_broken"])
+    def test_receiver_removal_disables_tracing(self, event_name, ctx, tmp_path, monkeypatch, no_subprocess):
+        """Removing the collector must clear stale tracing endpoints and restart Gunicorn."""
+        import charm as charm_module
+
+        env_file = tmp_path / "terrasquid.env"
+        env_file.write_text("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT=http://old:4318/v1/traces\n")
+        monkeypatch.setattr(charm_module, "TERRASQUID_ENV_FILE", env_file)
+        monkeypatch.setattr(charm_module.SquidAsAServiceCharm, "_database_url", lambda _self: "postgresql://host/db")
+        monkeypatch.setattr(charm_module.SquidAsAServiceCharm, "_get_or_generate_secret_key", lambda _self: "test-key")
+        relation = ops.testing.Relation("cos-agent", remote_app_name="opentelemetry-collector")
+        ctx.run(getattr(ctx.on, event_name)(relation), ops.testing.State(relations={relation}))
+        assert "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT=\n" in env_file.read_text()
+        no_subprocess.assert_any_call(["systemctl", "restart", "terrasquid-api"], check=True)
+
+    def test_systemd_output_is_scrapeable(self, ctx, monkeypatch):
+        """Every managed workload's standard streams must append to a log file."""
+        import charm as charm_module
+
+        written = {}
+        monkeypatch.setattr(Path, "write_text", lambda path, content: written.setdefault(str(path), content))
+        charm_module.SquidAsAServiceCharm._write_systemd_units(MagicMock())
+        for service, filename in (
+            ("terrasquid-api", "api"),
+            ("terrasquid-watcher", "watcher"),
+            ("terrasquid-squid-exporter", "squid-exporter"),
+        ):
+            content = written[f"/etc/systemd/system/{service}.service"]
+            assert f"StandardOutput=append:/var/log/terrasquid/{filename}.log" in content
+            assert f"StandardError=append:/var/log/terrasquid/{filename}.log" in content
+            assert "UMask=0027" in content
+
+    def test_rotation_preserves_open_output_files(self, ctx, tmp_path, monkeypatch):
+        """Rotation must retain the file descriptors systemd keeps open for output."""
+        import charm as charm_module
+
+        log_dir = tmp_path / "logs"
+        rotation = tmp_path / "logrotate"
+        monkeypatch.setattr(charm_module, "TERRASQUID_LOG_DIR", log_dir)
+        monkeypatch.setattr(charm_module, "TERRASQUID_LOGROTATE_FILE", rotation)
+        charm_module.SquidAsAServiceCharm._write_logging_config(MagicMock())
+        assert log_dir.stat().st_mode & 0o777 == 0o750
+        for filename in ("api.log", "watcher.log", "squid-exporter.log"):
+            assert (log_dir / filename).stat().st_mode & 0o777 == 0o640
+        assert f"{log_dir}/*.log" in rotation.read_text()
+        assert "copytruncate" in rotation.read_text()
+        assert "rotate 7" in rotation.read_text()
+
+    def test_gunicorn_logs_requests_without_queries_and_loads_after_fork(self, ctx, tmp_path, monkeypatch):
+        """Gunicorn must log requests without query strings and load tracing after fork."""
+        import charm as charm_module
+
+        config_file = tmp_path / "gunicorn.conf.py"
+        monkeypatch.setattr(charm_module, "GUNICORN_CONF_FILE", config_file)
+        mock_self = MagicMock()
+        mock_self.config = {"api-port": 8080, "gunicorn-workers": 4}
+        charm_module.SquidAsAServiceCharm._write_gunicorn_config(mock_self)
+        config = {}
+        exec(compile(config_file.read_text(), str(config_file), "exec"), config)
+        assert config["accesslog"] == "-"
+        assert config["errorlog"] == "-"
+        assert config["preload_app"] is False
+        assert "%(U)s" in config["access_log_format"]
+        assert "%(q)s" not in config["access_log_format"]
+        assert "%(r)s" not in config["access_log_format"]

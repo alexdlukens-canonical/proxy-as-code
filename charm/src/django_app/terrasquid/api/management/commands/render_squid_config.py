@@ -1,6 +1,7 @@
 """Management command: render_squid_config."""
 
 import json
+import logging
 import subprocess
 import sys
 from datetime import UTC, datetime
@@ -8,11 +9,14 @@ from pathlib import Path
 
 from django.conf import settings
 from django.core.management.base import BaseCommand
+from opentelemetry import trace
 
 from terrasquid.api.squid_render import render_squid_config, validate_squid_config
 
 SQUID_CONF = Path("/etc/squid/squid.conf")
 SQUID_CONF_NEW = Path("/etc/squid/squid.conf.new")
+tracer = trace.get_tracer(__name__)
+logger = logging.getLogger(__name__)
 
 
 class Command(BaseCommand):
@@ -31,6 +35,7 @@ class Command(BaseCommand):
             help="Write the rendered config to this path instead of applying it ('-' for stdout).",
         )
 
+    @tracer.start_as_current_span("squid.configure")
     def handle(self, *args, **options) -> None:
         """Execute the command."""
         from terrasquid.api.models import ConfigVersion, RenderedConfigHistory
@@ -60,8 +65,12 @@ class Command(BaseCommand):
         rendered = config_version.rendered_config or render_squid_config(version=config_version.version)
         self._apply(rendered, config_version.version)
 
+    @tracer.start_as_current_span("squid.apply_config")
     def _apply(self, rendered: str, version: int) -> None:
         """Write, validate, diff, atomically replace, and reload Squid."""
+        span = trace.get_current_span()
+        span.set_attribute("squid.config.version", version)
+        logger.info("Checking Squid configuration version %s", version)
         SQUID_CONF_NEW.parent.mkdir(parents=True, exist_ok=True)
         SQUID_CONF_NEW.write_text(rendered)
 
@@ -73,6 +82,7 @@ class Command(BaseCommand):
 
         ok, err = validate_squid_config(rendered)
         if not ok:
+            span.set_status(trace.StatusCode.ERROR, "Squid configuration validation failed")
             SQUID_CONF_NEW.unlink(missing_ok=True)
             self.stderr.write(f"Squid config validation failed: {err}")
             sys.exit(1)
@@ -83,12 +93,17 @@ class Command(BaseCommand):
         SQUID_CONF_NEW.replace(SQUID_CONF)
         self.stdout.write(f"Applied new Squid config to {SQUID_CONF}")
 
-        result = subprocess.run(
-            ["systemctl", "reload-or-restart", "squid"],
-            capture_output=True,
-            text=True,
-        )
+        with tracer.start_as_current_span("squid.reload") as reload_span:
+            result = subprocess.run(
+                ["systemctl", "reload-or-restart", "squid"],
+                capture_output=True,
+                text=True,
+            )
+            reload_span.set_attribute("process.exit.code", result.returncode)
+            if result.returncode != 0:
+                reload_span.set_status(trace.StatusCode.ERROR, "Squid reload failed")
         if result.returncode != 0:
+            span.set_status(trace.StatusCode.ERROR, "Squid reload failed")
             self.stderr.write(f"Squid reload failed: {(result.stderr or result.stdout).strip()}")
             if SQUID_CONF_BAK.exists():
                 SQUID_CONF_BAK.replace(SQUID_CONF)

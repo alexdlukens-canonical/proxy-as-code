@@ -23,6 +23,10 @@ dependencies = [
     "charmlibs-interfaces-tls-certificates",
     "cosl>=1.10.2",
     "django-prometheus>=2.5.0",
+    "opentelemetry-sdk>=1.31,<2",
+    "opentelemetry-exporter-otlp-proto-http>=1.31,<2",
+    "opentelemetry-instrumentation-django>=0.52b0,<1",
+    "opentelemetry-instrumentation-psycopg>=0.52b0,<1",
 ]
 
 [project.optional-dependencies]

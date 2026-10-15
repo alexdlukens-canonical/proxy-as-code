@@ -8,6 +8,8 @@ import sys
 def main() -> None:
     """Run administrative tasks."""
     os.environ.setdefault("DJANGO_SETTINGS_MODULE", "terrasquid.settings")
+    from terrasquid.telemetry import configure_tracing
+
     try:
         from django.core.management import execute_from_command_line
     except ImportError as exc:
@@ -16,7 +18,12 @@ def main() -> None:
             "available on your PYTHONPATH environment variable? Did you "
             "forget to activate a virtual environment?"
         ) from exc
-    execute_from_command_line(sys.argv)
+    provider = configure_tracing()
+    try:
+        execute_from_command_line(sys.argv)
+    finally:
+        if provider is not None:
+            provider.shutdown()
 
 
 if __name__ == "__main__":

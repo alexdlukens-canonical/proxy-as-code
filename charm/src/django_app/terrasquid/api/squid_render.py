@@ -7,6 +7,9 @@ from pathlib import Path
 from django.conf import settings
 from django.db.models import Prefetch
 from jinja2 import Environment, FileSystemLoader
+from opentelemetry import trace
+
+tracer = trace.get_tracer(__name__)
 
 
 def _get_jinja2_env() -> Environment:
@@ -21,6 +24,7 @@ def _get_jinja2_env() -> Environment:
     )
 
 
+@tracer.start_as_current_span("squid.render_config")
 def render_squid_config(version: int | None = None) -> str:
     """Render the Squid configuration from the current database state."""
     from .models import ACLRule, ConfigVersion, DestinationConfig, SourceACL
@@ -67,6 +71,7 @@ def render_squid_config(version: int | None = None) -> str:
     )
 
 
+@tracer.start_as_current_span("squid.validate_config")
 def validate_squid_config(config_text: str) -> tuple[bool, str]:
     """Dry-run validate a Squid config string.
 
@@ -88,7 +93,9 @@ def validate_squid_config(config_text: str) -> tuple[bool, str]:
                 timeout=10,
             )
             if result.returncode != 0:
+                trace.get_current_span().set_status(trace.StatusCode.ERROR, "Squid configuration validation failed")
                 return False, (result.stderr or result.stdout).strip()
             return True, ""
     except subprocess.TimeoutExpired:
+        trace.get_current_span().set_status(trace.StatusCode.ERROR, "Squid configuration validation timed out")
         return False, "Squid config validation timed out."

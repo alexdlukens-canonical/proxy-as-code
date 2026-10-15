@@ -24,7 +24,7 @@ from charms.data_platform_libs.v0.data_interfaces import (
     DatabaseEndpointsChangedEvent,
     DatabaseRequires,
 )
-from charms.grafana_agent.v0.cos_agent import COSAgentProvider
+from charms.grafana_agent.v0.cos_agent import COSAgentProvider, ProtocolNotFoundError
 from charms.traefik_k8s.v2.ingress import IngressPerAppRequirer
 
 import squid
@@ -39,6 +39,8 @@ TERRASQUID_ENV_FILE = Path("/etc/terrasquid/terrasquid.env")
 TERRASQUID_STATUS_FILE = Path("/var/lib/terrasquid/status.json")
 TERRASQUID_RUN_DIR = Path("/var/lib/terrasquid")
 TERRASQUID_CERTS_DIR = Path("/etc/terrasquid/certs")
+TERRASQUID_LOG_DIR = Path("/var/log/terrasquid")
+TERRASQUID_LOGROTATE_FILE = Path("/etc/logrotate.d/terrasquid")
 
 CERT_FILE = TERRASQUID_CERTS_DIR / "terrasquid.crt"
 KEY_FILE = TERRASQUID_CERTS_DIR / "terrasquid.key"
@@ -70,6 +72,8 @@ class SquidAsAServiceCharm(ops.CharmBase):
             metrics_rules_dir="./src/prometheus_alert_rules",
             dashboard_dirs=["./src/grafana_dashboards"],
             scrape_configs=self._cos_agent_scrape_configs,
+            tracing_protocols=["otlp_http"],
+            refresh_events=[self.on.config_changed, self.on.upgrade_charm],
         )
 
         self.framework.observe(self.on.install, self._on_install)
@@ -92,6 +96,9 @@ class SquidAsAServiceCharm(ops.CharmBase):
         self.framework.observe(self.on.leader_elected, self._on_leader_elected)
 
         self.framework.observe(self.on.squid_aaas_peers_relation_changed, self._on_peers_relation_changed)
+        self.framework.observe(self.on.cos_agent_relation_changed, self._on_cos_agent_relation_changed)
+        self.framework.observe(self.on.cos_agent_relation_departed, self._on_cos_agent_relation_changed)
+        self.framework.observe(self.on.cos_agent_relation_broken, self._on_cos_agent_relation_changed)
 
         self.framework.observe(self.on.create_key_action, self._on_create_key_action)
         self.framework.observe(self.on.revoke_key_action, self._on_revoke_key_action)
@@ -122,7 +129,7 @@ class SquidAsAServiceCharm(ops.CharmBase):
         subprocess.run(["systemctl", "reload-or-restart", SQUID_WATCHER_TIMER], capture_output=True)
         self._write_env_file()
         self._reload_gunicorn()
-        self._reload_squid_exporter()
+        subprocess.run(["systemctl", "restart", squid.SQUID_EXPORTER_SERVICE], check=True)
         if self._gunicorn_running():
             self._open_ports()
         self._publish_django_ingress_requirements()
@@ -145,6 +152,7 @@ class SquidAsAServiceCharm(ops.CharmBase):
         subprocess.run(["systemctl", "daemon-reload"], check=True)
         if not self._database_url():
             return
+        self._write_env_file()
         try:
             if self.unit.is_leader():
                 self._clear_migration_flag()
@@ -155,8 +163,9 @@ class SquidAsAServiceCharm(ops.CharmBase):
                 event.defer()
                 return
             self._run_manage("collectstatic", "--noinput")
-            self._reload_gunicorn()
+            subprocess.run(["systemctl", "restart", GUNICORN_SERVICE], check=True)
             subprocess.run(["systemctl", "enable", "--now", squid.SQUID_EXPORTER_SERVICE], check=True)
+            self._reload_squid_exporter()
         except subprocess.CalledProcessError as e:
             logger.error("Management command failed during charm upgrade: %s", e)
             self.unit.status = ops.BlockedStatus("Charm upgrade failed — check logs")
@@ -360,6 +369,30 @@ class SquidAsAServiceCharm(ops.CharmBase):
 
     # ── Helpers ───────────────────────────────────────────────────────────────
 
+    def _on_cos_agent_relation_changed(self, event: ops.RelationEvent) -> None:
+        """Refresh workload processes when the optional tracing receiver changes."""
+        if not self._database_url():
+            return
+        previous = TERRASQUID_ENV_FILE.read_text() if TERRASQUID_ENV_FILE.exists() else ""
+        endpoint = (
+            "" if isinstance(event, (ops.RelationDepartedEvent, ops.RelationBrokenEvent)) else self._tracing_endpoint()
+        )
+        self._write_env_file(tracing_endpoint=endpoint)
+        if TERRASQUID_ENV_FILE.read_text() != previous and self._gunicorn_running():
+            # HUP reloads workers but does not refresh the master's systemd environment.
+            subprocess.run(["systemctl", "restart", GUNICORN_SERVICE], check=True)
+
+    def _tracing_endpoint(self) -> str:
+        """Return the negotiated OTLP/HTTP receiver, or disable optional tracing."""
+        if not self.cos_agent.is_ready():
+            return ""
+        try:
+            endpoint = self.cos_agent.get_tracing_endpoint("otlp_http").rstrip("/")
+        except ProtocolNotFoundError:
+            logger.info("COS agent has no OTLP/HTTP receiver; workload tracing is disabled")
+            return ""
+        return endpoint if endpoint.endswith("/v1/traces") else f"{endpoint}/v1/traces"
+
     def _database_url(self) -> str:
         """Build a DATABASE_URL from the data provided by the postgresql relation."""
         if not self.database.relations:
@@ -375,7 +408,7 @@ class SquidAsAServiceCharm(ops.CharmBase):
         host_port = endpoints.split(",")[0]
         return f"postgresql://{username}:{quote(password, safe='')}@{host_port}/{database}"
 
-    def _write_env_file(self) -> None:
+    def _write_env_file(self, *, tracing_endpoint: str | None = None) -> None:
         """Write environment variables to /etc/terrasquid/terrasquid.env."""
         db_url = self._database_url()
         secret_key = self._get_or_generate_secret_key()
@@ -384,6 +417,19 @@ class SquidAsAServiceCharm(ops.CharmBase):
         squid_append_config = self.config.get("squid-append-config", "")
         squid_default_deny = self.config.get("squid-default-deny", True)
         squid_pinned_config_version = self.config.get("squid-pinned-config-version", 0)
+        if tracing_endpoint is None:
+            tracing_endpoint = self._tracing_endpoint()
+        resource_attributes = ",".join(
+            f"{key}={value}"
+            for key, value in {
+                "juju_model": self.model.name,
+                "juju_model_uuid": self.model.uuid,
+                "juju_application": self.app.name,
+                "juju_unit": self.unit.name,
+                "juju_charm": self.meta.name,
+                "service.instance.id": f"{self.model.uuid}/{self.unit.name}",
+            }.items()
+        )
 
         content = textwrap.dedent(f"""\
             DATABASE_URL={db_url}
@@ -398,6 +444,13 @@ class SquidAsAServiceCharm(ops.CharmBase):
             SQUID_DEFAULT_DENY={"true" if squid_default_deny else "false"}
             SQUID_PINNED_CONFIG_VERSION={squid_pinned_config_version}
             TERRASQUID_STATUS_FILE={TERRASQUID_STATUS_FILE}
+            OTEL_SERVICE_NAME={self.app.name}
+            OTEL_RESOURCE_ATTRIBUTES={resource_attributes}
+            OTEL_EXPORTER_OTLP_TRACES_ENDPOINT={tracing_endpoint}
+            OTEL_EXPORTER_OTLP_TRACES_CERTIFICATE=/etc/ssl/certs/ca-certificates.crt
+            OTEL_EXPORTER_OTLP_TIMEOUT=5
+            OTEL_TRACES_SAMPLER=parentbased_traceidratio
+            OTEL_TRACES_SAMPLER_ARG=0.1
         """)
         TERRASQUID_ENV_FILE.parent.mkdir(parents=True, exist_ok=True)
         TERRASQUID_ENV_FILE.write_text(content)
@@ -463,12 +516,17 @@ class SquidAsAServiceCharm(ops.CharmBase):
             if CA_FILE.exists():
                 ssl_config += f'ca_certs = "{CA_FILE}"\n'
 
-        content = f'bind = "[::]:{api_port}"\nworkers = {workers}\ntimeout = 120\nworker_class = "sync"\n' + ssl_config
+        content = (
+            f'bind = "[::]:{api_port}"\nworkers = {workers}\ntimeout = 120\nworker_class = "sync"\n'
+            'preload_app = False\naccesslog = "-"\nerrorlog = "-"\ncapture_output = True\n'
+            "access_log_format = '%(h)s %(m)s %(U)s %(s)s %(L)s'\n"
+        ) + ssl_config
         GUNICORN_CONF_FILE.parent.mkdir(parents=True, exist_ok=True)
         GUNICORN_CONF_FILE.write_text(content)
 
     def _write_systemd_units(self) -> None:
         """Write systemd unit files for Gunicorn and the config watcher."""
+        self._write_logging_config()
         self._write_gunicorn_config()
         gunicorn_unit = textwrap.dedent(f"""\
             [Unit]
@@ -486,8 +544,9 @@ class SquidAsAServiceCharm(ops.CharmBase):
                 terrasquid.wsgi:application
             Restart=on-failure
             RestartSec=5s
-            StandardOutput=journal
-            StandardError=journal
+            UMask=0027
+            StandardOutput=append:{TERRASQUID_LOG_DIR}/api.log
+            StandardError=append:{TERRASQUID_LOG_DIR}/api.log
 
             [Install]
             WantedBy=multi-user.target
@@ -505,8 +564,9 @@ class SquidAsAServiceCharm(ops.CharmBase):
             Environment=PYTHONPATH={DJANGO_APP_DIR}
             WorkingDirectory={DJANGO_APP_DIR}
             ExecStart={VENV_BIN}/python {DJANGO_APP_DIR}/manage.py render_squid_config
-            StandardOutput=journal
-            StandardError=journal
+            UMask=0027
+            StandardOutput=append:{TERRASQUID_LOG_DIR}/watcher.log
+            StandardError=append:{TERRASQUID_LOG_DIR}/watcher.log
         """)
         Path(f"/etc/systemd/system/{SQUID_WATCHER_SERVICE}.service").write_text(watcher_unit)
 
@@ -526,13 +586,35 @@ class SquidAsAServiceCharm(ops.CharmBase):
                 --listen 127.0.0.1:{SQUID_EXPORTER_PORT}
             Restart=on-failure
             RestartSec=5s
-            StandardOutput=journal
-            StandardError=journal
+            UMask=0027
+            StandardOutput=append:{TERRASQUID_LOG_DIR}/squid-exporter.log
+            StandardError=append:{TERRASQUID_LOG_DIR}/squid-exporter.log
 
             [Install]
             WantedBy=multi-user.target
         """)
         Path(f"/etc/systemd/system/{squid.SQUID_EXPORTER_SERVICE}.service").write_text(exporter_unit)
+
+    def _write_logging_config(self) -> None:
+        """Rotate file-backed service output without invalidating systemd's file descriptors."""
+        TERRASQUID_LOG_DIR.mkdir(parents=True, exist_ok=True, mode=0o750)
+        for filename in ("api.log", "watcher.log", "squid-exporter.log"):
+            (TERRASQUID_LOG_DIR / filename).touch(mode=0o640, exist_ok=True)
+        TERRASQUID_LOGROTATE_FILE.write_text(
+            textwrap.dedent(f"""\
+                {TERRASQUID_LOG_DIR}/*.log {{
+                    daily
+                    maxsize 20M
+                    rotate 7
+                    missingok
+                    notifempty
+                    compress
+                    delaycompress
+                    copytruncate
+                    su root root
+                }}
+            """)
+        )
 
     def _write_watcher_timer(self) -> None:
         """Write the systemd timer for periodic Squid configuration checks."""
