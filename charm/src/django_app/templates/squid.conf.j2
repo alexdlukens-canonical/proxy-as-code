@@ -46,7 +46,9 @@ acl dst__{{ dst.key_prefix }}__{{ dst.name }} dstdomain {{ dst.dst }}
 # Service: {{ entry.group.service }}; group: {{ entry.group.name }}
 {% endif %}
 {% for bucket in entry.buckets %}
-acl {{ bucket.acl_name }} any-of {{ bucket.destination_acl_names | join(' ') }}
+{% for line in bucket.destination_acl_names | any_of_lines(bucket.acl_name) %}
+{{ line }}
+{% endfor %}
 {% endfor %}
 {% endfor %}
 
@@ -67,11 +69,15 @@ acl CONNECT method CONNECT
 # Service: {{ rule.service }}; rule: {{ rule.name }}
 {% endif %}
 {% if entry.source_acl_names | length > 1 %}
-acl {{ entry.source_acl_name }} any-of {{ entry.source_acl_names | join(' ') }}
+{% for line in entry.source_acl_names | any_of_lines(entry.source_acl_name) %}
+{{ line }}
+{% endfor %}
 {% endif %}
 {% for bucket in entry.buckets %}
 {% if bucket.destination_acl_names | length > 1 %}
-acl rule_dst__{{ rule.key_prefix }}__{{ rule.name }}__{{ bucket.index }} any-of {{ bucket.destination_acl_names | join(' ') }}
+{% for line in bucket.destination_acl_names | any_of_lines(bucket.destination_acl_name) %}
+{{ line }}
+{% endfor %}
 {% endif %}
 {% endfor %}
 

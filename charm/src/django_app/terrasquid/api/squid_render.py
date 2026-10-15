@@ -11,17 +11,44 @@ from opentelemetry import trace
 
 tracer = trace.get_tracer(__name__)
 
+# Squid reads physical lines into an 8192-byte buffer, including newline and NUL.
+MAX_ACL_LINE_BYTES = 8190
+
+
+def _any_of_lines(acl_names: list[str], acl_name: str) -> list[str]:
+    """Split an OR group into byte-bounded definitions of the same ACL."""
+    prefix = f"acl {acl_name} any-of"
+    prefix_bytes = len(prefix.encode("utf-8"))
+    lines = []
+    members = []
+    line_bytes = prefix_bytes
+    for name in acl_names:
+        member_bytes = 1 + len(name.encode("utf-8"))
+        if prefix_bytes + member_bytes > MAX_ACL_LINE_BYTES:
+            raise ValueError(f"ACL reference {name!r} cannot fit on an any-of line for {acl_name!r}")
+        if line_bytes + member_bytes > MAX_ACL_LINE_BYTES:
+            lines.append(f"{prefix} {' '.join(members)}")
+            members = []
+            line_bytes = prefix_bytes
+        members.append(name)
+        line_bytes += member_bytes
+    if members:
+        lines.append(f"{prefix} {' '.join(members)}")
+    return lines
+
 
 def _get_jinja2_env() -> Environment:
     """Create a Jinja2 environment loading from the templates directory."""
     templates_dir = Path(__file__).parent.parent.parent / "templates"
-    return Environment(
+    env = Environment(
         loader=FileSystemLoader(str(templates_dir)),
         keep_trailing_newline=True,
         trim_blocks=True,
         lstrip_blocks=True,
         autoescape=False,
     )
+    env.filters["any_of_lines"] = _any_of_lines
+    return env
 
 
 def _destination_acl_name(destination) -> str:
