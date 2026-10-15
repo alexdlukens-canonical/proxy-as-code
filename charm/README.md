@@ -6,6 +6,22 @@ With Python 3.12 available, install `tox` and `tox-uv`, then run `tox -e unit`
 from the `charm/` directory. GitHub Actions runs the same unit suite on pull
 requests that change files under `charm/`.
 
+The unit command measures line and branch coverage for all Python code under
+`src/`, including the charm and Django application, but not vendored libraries
+under `lib/`. It lists uncovered lines in the terminal and writes an HTML report
+to `htmlcov/index.html` and a machine-readable report to `coverage.xml`.
+Open the HTML report in a browser to inspect uncovered lines and branches.
+Generated reports and coverage data are ignored by Git.
+
+To focus on one test class, run `tox -e unit -- -k TestInstall`.
+Coverage still includes all of `src/`, so a focused run will report lower overall
+coverage. To run without coverage, use `tox -e unit -- --no-cov`.
+No minimum coverage threshold is enforced.
+
+GitHub Actions uploads the HTML and XML reports as the `charm-unit-coverage`
+artifact, including when tests fail and reports are available. Download the
+artifact from the workflow run to inspect coverage.
+
 Charm libraries under `charm/lib/` are vendored dependencies and must be committed
 so the tests work from a clean checkout.
 

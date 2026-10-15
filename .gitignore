@@ -67,6 +67,10 @@ Thumbs.db
 *.charm
 .ruff_cache/
 .pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
 
 **/terraform.tfvars
 **/*.tfstate*
