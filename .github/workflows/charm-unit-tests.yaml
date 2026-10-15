@@ -1,0 +1,27 @@
+name: Charm unit tests
+
+on:
+  pull_request:
+    paths:
+      - "charm/**"
+
+permissions:
+  contents: read
+
+jobs:
+  unit-tests:
+    name: Charm unit tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: charm
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      - name: Install test tools
+        run: python -m pip install tox tox-uv
+      - name: Run unit tests
+        run: tox -e unit
