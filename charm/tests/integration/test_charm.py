@@ -445,7 +445,7 @@ def test_proxy_acl_rule_allows_traffic(juju, deployed_charms):
     squid_conf = _read_squid_conf(juju, deployed_charms["saas_app"])
     source_acl = f"acl src__{source['key_prefix']}__{source['name']}"
     destination_acl = f"acl dst__{destination['key_prefix']}__{destination['name']}"
-    rule_destination_acl = f"rule_dst__{rule['key_prefix']}__{rule['name']}__1"
+    rule_destination_acl = f"dst__{destination['key_prefix']}__{destination['name']}"
     rule_port_acl = "port__80"
     access_rule = (
         f"http_access allow src__{source['key_prefix']}__{source['name']} {rule_destination_acl} {rule_port_acl}"
