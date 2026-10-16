@@ -29,7 +29,7 @@
 | src/django\_app/terrasquid/api/permissions.py                                                     |       12 |        2 |        2 |        0 |     86% |     17-18 |
 | src/django\_app/terrasquid/api/policy.py                                                          |       21 |        0 |        4 |        0 |    100% |           |
 | src/django\_app/terrasquid/api/serializers.py                                                     |       84 |        5 |       26 |        4 |     92% |90, 98, 124, 128, 182 |
-| src/django\_app/terrasquid/api/squid\_render.py                                                   |      107 |        0 |       32 |        0 |    100% |           |
+| src/django\_app/terrasquid/api/squid\_render.py                                                   |      109 |        0 |       32 |        0 |    100% |           |
 | src/django\_app/terrasquid/api/urls.py                                                            |        9 |        0 |        0 |        0 |    100% |           |
 | src/django\_app/terrasquid/api/validators.py                                                      |       19 |        2 |       14 |        2 |     88% |    13, 21 |
 | src/django\_app/terrasquid/api/views.py                                                           |      163 |       37 |       22 |        6 |     76% |58-61, 108-109, 119-120, 133-138, 145, 180-183, 209, 226-229, 240-248, 264-265, 270-274 |
@@ -40,7 +40,7 @@
 | src/django\_app/terrasquid/urls.py                                                                |        7 |        1 |        2 |        1 |     78% |        19 |
 | src/django\_app/terrasquid/wsgi.py                                                                |        6 |        6 |        0 |        0 |      0% |      3-12 |
 | src/squid.py                                                                                      |       24 |        0 |        2 |        0 |    100% |           |
-| **TOTAL**                                                                                         | **1489** |  **165** |  **306** |   **43** | **87%** |           |
+| **TOTAL**                                                                                         | **1491** |  **165** |  **306** |   **43** | **87%** |           |
 
 
 ## Setup coverage badge
