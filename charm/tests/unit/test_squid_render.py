@@ -5,7 +5,12 @@ from django.core.exceptions import ValidationError
 from django.db import connection
 from django.db.migrations.executor import MigrationExecutor
 from terrasquid.api.models import ACLRule, DestinationConfig, DestinationGroup, SourceACL
-from terrasquid.api.squid_render import MAX_ACL_LINE_BYTES, _any_of_lines, render_squid_config
+from terrasquid.api.squid_render import (
+    MAX_ACL_LINE_BYTES,
+    _any_of_lines,
+    _destination_group_acl_name,
+    render_squid_config,
+)
 from terrasquid.api.validators import validate_port_ranges, validate_ports
 
 
@@ -124,6 +129,67 @@ def test_short_any_of_lines(names):
     """Small groups keep their original representation."""
     expected = [f"acl group any-of {' '.join(names)}"] if names else []
     assert _any_of_lines(names, "group") == expected
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize("grouped", [False, True])
+@pytest.mark.parametrize("comment", ["", "Permit client traffic"])
+def test_render_places_rule_comments_next_to_access_lines(grouped, comment):
+    """Rule comments follow their access lines through priority and action sorting."""
+    source = SourceACL.objects.create(service="test", key_prefix="ab12cd34", name="source", cidr=["10.0.0.0/8"])
+    rules = [
+        ACLRule.objects.create(service="test", key_prefix="ab12cd34", name=name, priority=priority, comment=comment)
+        for name, priority in [("first", 100), ("earlier", 99), ("last", 100)]
+    ]
+    actions = [("DENY", "deny", 80), ("CONNECT", "allow", 443), ("ALLOW", "allow", 80)]
+    for rule in rules:
+        rule.sources.add(source)
+        destinations = [
+            DestinationConfig.objects.create(
+                service="test",
+                key_prefix="ab12cd34",
+                name=f"{rule.name}-{action.lower()}",
+                dst=f"{rule.name}-{action.lower()}.example.com",
+                type=action,
+            )
+            for action, _, _ in actions
+        ]
+        if grouped:
+            group = DestinationGroup.objects.create(service="test", key_prefix="ab12cd34", name=rule.name)
+            group.destinations.add(*destinations)
+            rule.destination_groups.add(group)
+        else:
+            rule.destinations.add(*destinations)
+
+    config = render_squid_config()
+    lines = config.splitlines()
+    actual = [
+        (lines[index - 1], line)
+        for index, line in enumerate(lines)
+        if line.startswith("http_access ") and "src__ab12cd34__source" in line
+    ]
+    expected = []
+    for rule, action, access_action, port in [
+        (rule, action, access_action, port)
+        for ordered_rules in [[rules[1]], [rules[0], rules[2]]]
+        for action, access_action, port in actions
+        for rule in ordered_rules
+    ]:
+        if grouped:
+            destination_name = _destination_group_acl_name(
+                rule.destination_groups.get(), {"ALLOW": 1, "CONNECT": 2, "DENY": 3}[action]
+            )
+        else:
+            destination_name = f"dst__ab12cd34__{rule.name}-{action.lower()}"
+        method = " CONNECT" if action == "CONNECT" else ""
+        expected.append(
+            (
+                f"# {comment}" if comment else f"# Service: test; rule: {rule.name}",
+                f"http_access {access_action} src__ab12cd34__source{method} {destination_name} port__{port}",
+            )
+        )
+    assert actual == expected
+    assert sum(line.startswith("# Service: test; rule:") or line == f"# {comment}" for line in lines) == len(actual)
 
 
 @pytest.mark.parametrize("offset", [-1, 0, 1])

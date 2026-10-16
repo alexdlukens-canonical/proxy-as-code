@@ -61,12 +61,6 @@ acl CONNECT method CONNECT
 
 # ======= ACL Rules (ordered by priority) =======
 {% for entry in rule_entries %}
-{% set rule = entry.rule %}
-{% if rule.comment %}
-# {{ rule.comment }}
-{% else %}
-# Service: {{ rule.service }}; rule: {{ rule.name }}
-{% endif %}
 {% if entry.source_acl_names | length > 1 %}
 {% for line in entry.source_acl_names | any_of_lines(entry.source_acl_name) %}
 {{ line }}
@@ -79,12 +73,16 @@ acl CONNECT method CONNECT
 {% endfor %}
 {% endif %}
 {% endfor %}
-
 {% endfor %}
 {% for entry in acl_access_entries %}
 {% set rule = entry.rule %}
 {% set bucket = entry.bucket %}
 {% set action = 'allow' if bucket.type in ('ALLOW', 'CONNECT') else 'deny' %}
+{% if rule.comment %}
+# {{ rule.comment }}
+{% else %}
+# Service: {{ rule.service }}; rule: {{ rule.name }}
+{% endif %}
 http_access {{ action }} {{ entry.source_acl_name }}{% if bucket.type == 'CONNECT' %} CONNECT{% endif %} {{ bucket.destination_acl_name }} port__{{ bucket.ports | join('_') }}
 {% endfor %}
 
