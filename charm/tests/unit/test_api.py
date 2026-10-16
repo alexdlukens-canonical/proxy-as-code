@@ -679,11 +679,11 @@ class TestSquidConfigValidation(TestCase):
         assert (
             config.splitlines().count(
                 "http_access allow src__ab12cd34__local-source CONNECT "
-                "dst_group__dc34ab12__common-sites-cloud-access__1 port__443"
+                "dst_group__dc34ab12__dea0b928368d8a4c834f7b10a36718e0__1 port__443"
             )
             == 2
         )
-        assert config.count("acl dst_group__dc34ab12__common-sites-cloud-access__1 any-of") == 1
+        assert config.count("acl dst_group__dc34ab12__dea0b928368d8a4c834f7b10a36718e0__1 any-of") == 1
         assert "acl rule_dst__ab12cd34__allow-common-sites__1" not in config
         assert "acl rule_dst__ab12cd34__allow-common-sites-again__1" not in config
 
@@ -756,13 +756,14 @@ class TestSquidConfigValidation(TestCase):
         assert "acl rule_dst__ab12cd34__allow-common-sites__" not in config
         assert (
             config.count(
-                "http_access allow src__ab12cd34__local-source CONNECT dst_group__dc34ab12__common-sites-cloud-access__"
+                "http_access allow src__ab12cd34__local-source CONNECT "
+                "dst_group__dc34ab12__dea0b928368d8a4c834f7b10a36718e0__"
             )
             == 2
         )
         assert (
             config.count(
-                "http_access deny src__ab12cd34__local-source dst_group__dc34ab12__common-sites-cloud-access__"
+                "http_access deny src__ab12cd34__local-source dst_group__dc34ab12__dea0b928368d8a4c834f7b10a36718e0__"
             )
             == 1
         )

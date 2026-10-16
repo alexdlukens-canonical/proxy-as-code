@@ -1,5 +1,19 @@
 # Terrasquid Charm
 
+## Destination group names
+
+Keep human-readable names in destination groups' `name` field. The charm preserves
+those names in the API and database, but uses a deterministic MD5 hash of the name
+in generated Squid ACL identifiers to stay within Squid's 63-character limit.
+The service key prefix and policy-bucket suffix remain part of each identifier.
+MD5 is used only for naming, not security.
+
+Each rendered group includes a comment with its service and friendly name, as
+well as any custom comment. Callers do not need to hash destination-group names
+in Terraform. Existing groups need no database migration or Terraform renaming;
+their internal ACL definitions and references change together on the next render.
+Source, individual destination, and rule naming are unchanged.
+
 ## Destination port ranges
 
 Destination resources accept an optional `port_ranges` list in addition to the

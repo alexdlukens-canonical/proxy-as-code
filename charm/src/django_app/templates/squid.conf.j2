@@ -40,10 +40,9 @@ acl dst__{{ dst.key_prefix }}__{{ dst.name }} dstdomain {{ dst.dst }}
 
 # ======= Destination Group ACLs =======
 {% for entry in destination_group_entries %}
+# Service: {{ entry.group.service }}; group: {{ entry.group.name }}
 {% if entry.group.comment %}
 # {{ entry.group.comment }}
-{% else %}
-# Service: {{ entry.group.service }}; group: {{ entry.group.name }}
 {% endif %}
 {% for bucket in entry.buckets %}
 {% for line in bucket.destination_acl_names | any_of_lines(bucket.acl_name) %}

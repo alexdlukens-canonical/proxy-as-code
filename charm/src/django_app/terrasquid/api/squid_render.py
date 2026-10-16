@@ -1,5 +1,6 @@
 """Squid configuration rendering and validation helpers."""
 
+import hashlib
 import subprocess
 import tempfile
 from pathlib import Path
@@ -58,7 +59,8 @@ def _destination_acl_name(destination) -> str:
 
 
 def _destination_group_acl_name(group, index: int) -> str:
-    return f"dst_group__{group.key_prefix}__{group.name}__{index}"
+    name_hash = hashlib.md5(group.name.encode("utf-8"), usedforsecurity=False).hexdigest()
+    return f"dst_group__{group.key_prefix}__{name_hash}__{index}"
 
 
 def _source_acl_name(source) -> str:
