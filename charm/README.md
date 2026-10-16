@@ -1,5 +1,23 @@
 # Terrasquid Charm
 
+## Destination port ranges
+
+Destination resources accept an optional `port_ranges` list in addition to the
+existing integer `ports` list. For example, `"port_ranges": ["30000-32767"]` allows
+an inclusive range without expanding the generated Squid port ACL into thousands
+of individual ports. Ports and range endpoints must be between `1` and `65535`,
+and each range must have start less than or equal to end.
+
+The API combines both lists. A destination with only ranges does not gain an
+implicit default port. When both lists are unset, `null`, or empty, the existing
+defaults remain: `443` for `CONNECT`, otherwise `80`.
+
+`port_ranges` defaults to `null`, including for existing database records after
+the upgrade migration. Existing integer-only policies render unchanged.
+API updates can clear ranges with `[]` or `null`; partial updates that omit
+`port_ranges` retain its current value. The Terraform destination resource
+also supports optional `port_ranges`, defaulting to unset.
+
 ## Persistent credentials
 
 The Django `SECRET_KEY` is stored in the application-owned Juju secret labelled

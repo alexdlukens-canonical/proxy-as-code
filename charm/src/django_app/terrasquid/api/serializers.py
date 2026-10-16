@@ -11,6 +11,7 @@ from .models import (
     DestinationGroup,
     SourceACL,
 )
+from .validators import PORT_RANGE_PATTERN, validate_port_ranges, validate_ports
 
 
 class BaseResourceSerializer(serializers.ModelSerializer):
@@ -49,6 +50,23 @@ class SourceACLSerializer(BaseResourceSerializer):
 class DestinationConfigSerializer(BaseResourceSerializer):
     """Serializer for DestinationConfig resources."""
 
+    ports = serializers.ListField(
+        child=serializers.IntegerField(min_value=1, max_value=65535),
+        required=False,
+        allow_null=True,
+        validators=[validate_ports],
+    )
+    port_ranges = serializers.ListField(
+        child=serializers.RegexField(rf"^{PORT_RANGE_PATTERN}$", trim_whitespace=False),
+        required=False,
+        allow_null=True,
+        validators=[validate_port_ranges],
+        help_text=(
+            "Inclusive start-end ranges with endpoints between 1 and 65535 and start <= end. "
+            "Combined with ports; defaults apply only when both lists are empty or unset."
+        ),
+    )
+
     class Meta:
         model = DestinationConfig
         fields = [
@@ -59,6 +77,7 @@ class DestinationConfigSerializer(BaseResourceSerializer):
             "dst",
             "type",
             "ports",
+            "port_ranges",
             "comment",
             "created_at",
             "updated_at",
