@@ -157,6 +157,44 @@ def test_any_of_rejects_oversized_reference():
 
 
 @pytest.mark.django_db
+@pytest.mark.parametrize("name", ["proxy-group-stg-terrasquid-ps7-general-sites", "g" * 63])
+@pytest.mark.parametrize("comment", ["", "Shared destinations"])
+def test_render_hashes_destination_group_names(name, comment):
+    """Friendly group names survive storage without exceeding Squid's ACL limit."""
+    source = SourceACL.objects.create(service="test", key_prefix="MW9oiAim", name="source", cidr=["10.0.0.0/8"])
+    rule = ACLRule.objects.create(service="test", key_prefix="MW9oiAim", name="rule")
+    rule.sources.add(source)
+    groups = [
+        DestinationGroup.objects.create(service="test", key_prefix="MW9oiAim", name=group_name, comment=comment)
+        for group_name in [name, name[:-1] + "h"]
+    ]
+    for action in ["ALLOW", "CONNECT", "DENY"]:
+        destination = DestinationConfig.objects.create(
+            service="test", key_prefix="MW9oiAim", name=action.lower(), dst="192.0.2.0/24", type=action
+        )
+        for group in groups:
+            group.destinations.add(destination)
+    rule.destination_groups.add(*groups)
+
+    config = render_squid_config()
+    group_names = [line.split()[1] for line in config.splitlines() if line.startswith("acl dst_group__")]
+    assert len(group_names) == len(set(group_names)) == 6
+    assert all(len(acl_name.encode("utf-8")) <= 63 for acl_name in group_names)
+    for group in groups:
+        group.refresh_from_db()
+        assert f"# Service: test; group: {group.name}\n" in config
+        assert group.name in [name, name[:-1] + "h"]
+        assert not any(group.name in acl_name for acl_name in group_names)
+    if comment:
+        assert config.count(f"# {comment}\n") == 2
+    referenced_groups = [
+        member for line in config.splitlines() if line.startswith("acl rule_dst__") for member in line.split()[3:]
+    ]
+    assert sorted(referenced_groups) == sorted(group_names)
+    assert render_squid_config() == config
+
+
+@pytest.mark.django_db
 def test_render_splits_all_any_of_groups():
     """Large source, destination, and reusable groups retain every reference."""
     sources = SourceACL.objects.bulk_create(
@@ -191,10 +229,13 @@ def test_render_splits_all_any_of_groups():
 
     config = render_squid_config()
     expected_members = {
-        "dst_group__ab12cd34__sites__1": [f"dst__ab12cd34__{item.name}" for item in destinations[:120]],
+        "dst_group__ab12cd34__d27edbd18c3bdf9ce1d013c6626ba26c__1": [
+            f"dst__ab12cd34__{item.name}" for item in destinations[:120]
+        ],
         "rule_src__ab12cd34__rule": [f"src__ab12cd34__{item.name}" for item in sources],
         "rule_dst__ab12cd34__rule__1": sorted(
-            ["dst_group__ab12cd34__sites__1"] + [f"dst__ab12cd34__{item.name}" for item in destinations[120:]]
+            ["dst_group__ab12cd34__d27edbd18c3bdf9ce1d013c6626ba26c__1"]
+            + [f"dst__ab12cd34__{item.name}" for item in destinations[120:]]
         ),
     }
     for acl_name, members in expected_members.items():
