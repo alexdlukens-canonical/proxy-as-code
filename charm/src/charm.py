@@ -70,15 +70,6 @@ class SquidAsAServiceCharm(ops.CharmBase):
         self.certificates = TLSCertificatesRequiresV4(self, "certificates", certificate_requests=_cert_requests)
         self.django_ingress = IngressPerAppRequirer(self, relation_name="django-ingress")
         self.squid_ingress = IngressPerAppRequirer(self, relation_name="squid-ingress")
-        self.cos_agent = COSAgentProvider(
-            self,
-            metrics_rules_dir="./src/prometheus_alert_rules",
-            dashboard_dirs=["./src/grafana_dashboards"],
-            scrape_configs=self._cos_agent_scrape_configs,
-            tracing_protocols=["otlp_http"],
-            refresh_events=[self.on.config_changed, self.on.upgrade_charm],
-        )
-
         self.framework.observe(self.on.install, self._on_install)
         self.framework.observe(self.on.config_changed, self._on_config_changed)
         self.framework.observe(self.on.start, self._on_start)
@@ -93,6 +84,21 @@ class SquidAsAServiceCharm(ops.CharmBase):
         self.framework.observe(self.on.certificates_relation_joined, self._on_certificates_relation_joined)
         self.framework.observe(self.certificates.on.certificate_available, self._on_certificate_available)
         self.framework.observe(self.certificates.on.certificate_denied, self._on_certificate_denied)
+
+        # Refresh scrape jobs only after certificate handlers update the TLS files.
+        self.cos_agent = COSAgentProvider(
+            self,
+            metrics_rules_dir="./src/prometheus_alert_rules",
+            dashboard_dirs=["./src/grafana_dashboards"],
+            scrape_configs=self._cos_agent_scrape_configs,
+            tracing_protocols=["otlp_http"],
+            refresh_events=[
+                self.on.config_changed,
+                self.on.upgrade_charm,
+                self.certificates.on.certificate_available,
+                self.certificates.on.certificate_denied,
+            ],
+        )
 
         self.framework.observe(self.on.django_ingress_relation_joined, self._on_django_ingress_relation_joined)
         self.framework.observe(self.on.squid_ingress_relation_joined, self._on_squid_ingress_relation_joined)
@@ -734,12 +740,21 @@ class SquidAsAServiceCharm(ops.CharmBase):
         self.squid_ingress.provide_ingress_requirements(port=squid_port, ip=ip)
 
     def _cos_agent_scrape_configs(self) -> list[dict]:
-        """Build the local Prometheus scrape target from the current API port."""
+        """Build local scrape jobs matching the API listener's TLS configuration."""
+        api_job = {
+            "metrics_path": "/metrics",
+            "static_configs": [{"targets": [f"localhost:{int(self.config.get('api-port', 8080))}"]}],
+        }
+        if CERT_FILE.exists() and KEY_FILE.exists():
+            tls_config = {}
+            if hostname := self.config.get("external-hostname"):
+                tls_config["server_name"] = hostname
+            if CA_FILE.exists():
+                tls_config["ca"] = CA_FILE.read_text()
+            api_job.update(scheme="https", tls_config=tls_config)
+
         return [
-            {
-                "metrics_path": "/metrics",
-                "static_configs": [{"targets": [f"localhost:{int(self.config.get('api-port', 8080))}"]}],
-            },
+            api_job,
             {
                 "metrics_path": "/metrics",
                 "static_configs": [{"targets": [f"localhost:{SQUID_EXPORTER_PORT}"]}],
