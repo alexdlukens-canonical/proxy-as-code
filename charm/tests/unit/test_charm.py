@@ -327,6 +327,104 @@ class TestCollectUnitStatus:
 class TestCOSAgentRelation:
     """Tests for COS agent telemetry publication."""
 
+    def test_certificate_events_refresh_scrape_tls(self, ctx, tmp_path, monkeypatch):
+        """Issuance, CA renewal, and denial publish the updated listener configuration."""
+        from datetime import timedelta
+
+        from charmlibs.interfaces.tls_certificates import (
+            CertificateError,
+            generate_ca,
+            generate_certificate,
+            generate_csr,
+            generate_private_key,
+        )
+
+        import charm as charm_module
+
+        monkeypatch.setattr(charm_module, "TERRASQUID_CERTS_DIR", tmp_path)
+        for name in ("CERT_FILE", "KEY_FILE", "CA_FILE"):
+            monkeypatch.setattr(charm_module, name, tmp_path / name)
+        monkeypatch.setattr(charm_module.SquidAsAServiceCharm, "_write_gunicorn_config", MagicMock())
+        monkeypatch.setattr(charm_module.SquidAsAServiceCharm, "_reload_gunicorn", MagicMock())
+        monkeypatch.setattr(charm_module.SquidAsAServiceCharm, "_publish_django_ingress_requirements", MagicMock())
+        key = generate_private_key()
+        csr = generate_csr(private_key=key, common_name="terrasquid.example.com")
+        cos_relation = ops.testing.Relation("cos-agent", remote_app_name="grafana-agent")
+        state = ops.testing.State(config={"external-hostname": "terrasquid.example.com"}, relations={cos_relation})
+        with ctx(ctx.on.relation_joined(cos_relation), state) as mgr:
+            relation = mgr.charm.model.get_relation("cos-agent")
+            with patch.object(mgr.charm.certificates, "get_private_key", return_value=key):
+                for ca_name in ("initial-ca", "renewed-ca"):
+                    ca = generate_ca(private_key=key, validity=timedelta(days=1), common_name=ca_name)
+                    certificate = generate_certificate(csr=csr, ca=ca, ca_private_key=key, validity=timedelta(days=1))
+                    mgr.charm.certificates.on.certificate_available.emit(
+                        certificate=certificate, certificate_signing_request=csr, ca=ca, chain=[ca]
+                    )
+                    data = json.loads(relation.data[mgr.charm.unit]["config"])
+                    api_job = next(
+                        job
+                        for job in data["metrics_scrape_jobs"]
+                        if job["static_configs"][0]["targets"] == ["localhost:8080"]
+                    )
+                    assert api_job["scheme"] == "https"
+                    assert api_job["tls_config"] == {"ca": ca.raw, "server_name": "terrasquid.example.com"}
+
+            mgr.charm.certificates.on.certificate_denied.emit(
+                certificate_signing_request=csr,
+                error=CertificateError(code=1, name="denied", message="Certificate denied"),
+            )
+            data = json.loads(relation.data[mgr.charm.unit]["config"])
+            assert all("scheme" not in job and "tls_config" not in job for job in data["metrics_scrape_jobs"])
+            mgr.run()
+
+    @pytest.mark.parametrize(
+        ("has_cert", "has_key", "has_ca", "hostname", "port"),
+        [
+            (True, True, True, "terrasquid.example.com", 8080),
+            (True, True, True, "terrasquid.example.com", 8443),
+            (True, True, False, "terrasquid.example.com", 8080),
+            (True, True, True, "", 8080),
+            (True, False, True, "terrasquid.example.com", 8080),
+            (False, True, True, "terrasquid.example.com", 8080),
+            (False, False, False, "", 8080),
+        ],
+    )
+    def test_scrape_tls_matches_api_listener(
+        self, ctx, tmp_path, monkeypatch, has_cert, has_key, has_ca, hostname, port
+    ):
+        """Published API jobs verify TLS without requiring agent access to certificate files."""
+        import charm as charm_module
+
+        for name, present in (("CERT_FILE", has_cert), ("KEY_FILE", has_key), ("CA_FILE", has_ca)):
+            path = tmp_path / name
+            monkeypatch.setattr(charm_module, name, path)
+            if present:
+                path.write_text("CA PEM" if name == "CA_FILE" else name)
+
+        cos_relation = ops.testing.Relation("cos-agent", remote_app_name="grafana-agent")
+        state = ops.testing.State(config={"external-hostname": hostname, "api-port": port}, relations={cos_relation})
+        with ctx(ctx.on.relation_joined(cos_relation), state) as mgr:
+            mgr.run()
+            relation = mgr.charm.model.get_relation("cos-agent")
+            data = json.loads(relation.data[mgr.charm.unit]["config"])
+
+        jobs = {job["static_configs"][0]["targets"][0]: job for job in data["metrics_scrape_jobs"]}
+        api_job = jobs[f"localhost:{port}"]
+        assert api_job["metrics_path"] == "/metrics"
+        if has_cert and has_key:
+            assert api_job["scheme"] == "https"
+            expected_tls = {}
+            if hostname:
+                expected_tls["server_name"] = hostname
+            if has_ca:
+                expected_tls["ca"] = "CA PEM"
+            assert api_job["tls_config"] == expected_tls
+        else:
+            assert "scheme" not in api_job
+            assert "tls_config" not in api_job
+        assert "scheme" not in jobs["localhost:9301"]
+        assert "tls_config" not in jobs["localhost:9301"]
+
     def test_relation_advertises_metrics_dashboard_and_alert_rules(self, ctx, base_state):
         """COS relation data must advertise the local metrics scrape target and bundled artifacts."""
         cos_relation = ops.testing.Relation("cos-agent", remote_app_name="grafana-agent")
