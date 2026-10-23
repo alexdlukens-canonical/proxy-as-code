@@ -48,6 +48,28 @@ def _read_squid_conf(juju: jubilant.Juju, app: str) -> str:
     return result.stdout
 
 
+def _read_local_metrics(juju: jubilant.Juju, app: str) -> str:
+    """Fetch the metrics endpoint from the application unit's loopback interface."""
+    result = subprocess.run(
+        [
+            JUJU_BIN,
+            "exec",
+            "--model",
+            juju.model,
+            "--unit",
+            f"{app}/0",
+            "--",
+            "curl",
+            "--fail",
+            "http://127.0.0.1:8080/metrics",
+        ],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    return result.stdout
+
+
 # ── Tests ─────────────────────────────────────────────────────────────────────
 
 
@@ -72,13 +94,15 @@ def test_status_endpoint_is_accessible(juju, deployed_charms):
 
 
 def test_metrics_endpoint_exposes_squid_configuration_versions(juju, deployed_charms):
-    """GET /metrics must expose desired and deployed Squid configuration versions."""
+    """Only localhost can fetch Squid configuration metrics."""
     address = _unit_address(juju, deployed_charms["saas_app"])
     response = requests.get(f"http://{address}:8080/metrics", timeout=10)
-    assert response.status_code == 200
-    assert "terrasquid_squid_config_desired_version" in response.text
-    assert "terrasquid_squid_config_applied_version" in response.text
-    assert "terrasquid_squid_config_version_skew" in response.text
+    assert response.status_code == 403
+
+    metrics = _read_local_metrics(juju, deployed_charms["saas_app"])
+    assert "terrasquid_squid_config_desired_version" in metrics
+    assert "terrasquid_squid_config_applied_version" in metrics
+    assert "terrasquid_squid_config_version_skew" in metrics
 
 
 def test_otelcol_relation_keeps_terrasquid_active_and_metrics_reachable(juju, deployed_charms_with_otelcol):
@@ -91,8 +115,10 @@ def test_otelcol_relation_keeps_terrasquid_active_and_metrics_reachable(juju, de
 
     address = _unit_address(juju, app)
     response = requests.get(f"http://{address}:8080/metrics", timeout=10)
-    assert response.status_code == 200
-    assert "terrasquid_squid_config_applied_version" in response.text
+    assert response.status_code == 403
+
+    metrics = _read_local_metrics(juju, app)
+    assert "terrasquid_squid_config_applied_version" in metrics
 
     exporter_response = subprocess.run(
         [

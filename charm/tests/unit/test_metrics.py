@@ -13,6 +13,12 @@ from terrasquid.api.models import ConfigVersion
 class TestMetricsEndpoint(TestCase):
     """Tests for unauthenticated Prometheus metrics."""
 
+    def test_rejects_non_loopback_clients(self) -> None:
+        """Metrics must not be served to clients outside localhost."""
+        response = APIClient().get("/metrics", REMOTE_ADDR="192.0.2.1")
+
+        assert response.status_code == 403
+
     @override_settings(JUJU_UNIT_NAME="terrasquid/0")
     def test_reports_deployed_squid_configuration_version(self) -> None:
         """Metrics must distinguish the database version from this unit's deployed version."""
