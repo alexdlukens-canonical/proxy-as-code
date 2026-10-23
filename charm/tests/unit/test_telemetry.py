@@ -85,6 +85,8 @@ def tracing_environment(otlp_receiver):
         "DJANGO_SETTINGS_MODULE": "terrasquid.settings",
         "DATABASE_URL": "sqlite:///:memory:",
         "DEBUG": "true",
+        "METRICS_USERNAME": "metrics",
+        "METRICS_PASSWORD": "test-password",
         "OTEL_SERVICE_NAME": "terrasquid-test",
         "OTEL_RESOURCE_ATTRIBUTES": "juju_model=test,juju_unit=terrasquid/0",
         "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT": endpoint,
@@ -97,6 +99,7 @@ def test_workload_exports_django_and_squid_spans(tmp_path, outcome, otlp_receive
     """A real Django request must export correlated spans through an OTLP/HTTP receiver."""
     _endpoint, batches = otlp_receiver
     code = textwrap.dedent("""\
+        import base64
         import logging
         import subprocess
         import sys
@@ -160,7 +163,8 @@ def test_workload_exports_django_and_squid_spans(tmp_path, outcome, otlp_receive
             response = client.get("/work/", HTTP_AUTHORIZATION="Api-Key do-not-export",
                                   HTTP_TRACEPARENT="00-11111111111111111111111111111111-2222222222222222-01")
             assert response.status_code == (500 if outcome.endswith("error") else 200)
-            assert client.get("/metrics?test=1").status_code == 200
+            metrics_authorization = "Basic " + base64.b64encode(b"metrics:test-password").decode()
+            assert client.get("/metrics?test=1", HTTP_AUTHORIZATION=metrics_authorization).status_code == 200
             assert client.get("/api/v1/status/").status_code == 200
         provider.shutdown()
     """)

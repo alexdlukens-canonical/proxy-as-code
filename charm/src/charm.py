@@ -53,6 +53,8 @@ SQUID_WATCHER_TIMER = "terrasquid-watcher.timer"
 SQUID_EXPORTER_PORT = 9301
 DJANGO_SECRET_LABEL = "terrasquid-django"
 DJANGO_SECRET_ID_KEY = "django-secret-id"
+METRICS_SECRET_LABEL = "terrasquid-metrics"
+METRICS_SECRET_ID_KEY = "metrics-secret-id"
 SECRET_WAIT_MESSAGE = "Waiting for leader to create application secret"
 
 
@@ -95,6 +97,9 @@ class SquidAsAServiceCharm(ops.CharmBase):
             refresh_events=[
                 self.on.config_changed,
                 self.on.upgrade_charm,
+                self.on.leader_elected,
+                self.on.squid_aaas_peers_relation_joined,
+                self.on.squid_aaas_peers_relation_changed,
                 self.certificates.on.certificate_available,
                 self.certificates.on.certificate_denied,
             ],
@@ -126,6 +131,7 @@ class SquidAsAServiceCharm(ops.CharmBase):
         TERRASQUID_CERTS_DIR.mkdir(parents=True, exist_ok=True)
         TERRASQUID_ENV_FILE.parent.mkdir(parents=True, exist_ok=True)
         self._get_or_generate_secret_key()
+        self._get_or_generate_metrics_credentials()
         self._write_systemd_units()
         subprocess.run(["systemctl", "daemon-reload"], check=True)
 
@@ -166,6 +172,9 @@ class SquidAsAServiceCharm(ops.CharmBase):
         self._write_systemd_units()
         subprocess.run(["systemctl", "daemon-reload"], check=True)
         if self._get_or_generate_secret_key() is None:
+            event.defer()
+            return
+        if self._get_or_generate_metrics_credentials() is None:
             event.defer()
             return
         if not self._database_url():
@@ -229,6 +238,7 @@ class SquidAsAServiceCharm(ops.CharmBase):
 
     def _on_leader_elected(self, _event: ops.LeaderElectedEvent) -> None:
         self._get_or_generate_secret_key()
+        self._get_or_generate_metrics_credentials()
         self._publish_django_ingress_requirements()
         self._publish_squid_ingress_requirements()
 
@@ -275,6 +285,7 @@ class SquidAsAServiceCharm(ops.CharmBase):
     def _on_peers_relation_changed(self, event: ops.RelationEvent) -> None:
         if self.unit.is_leader():
             self._get_or_generate_secret_key()
+            self._get_or_generate_metrics_credentials()
             return
         if not self._database_url():
             return
@@ -453,6 +464,9 @@ class SquidAsAServiceCharm(ops.CharmBase):
         secret_key = self._get_or_generate_secret_key()
         if secret_key is None:
             return False
+        metrics_credentials = self._get_or_generate_metrics_credentials()
+        if metrics_credentials is None:
+            return False
         squid_port = self.config.get("squid-port", 3128)
         squid_prepend_config = self.config.get("squid-prepend-config", "")
         squid_append_config = self.config.get("squid-append-config", "")
@@ -475,6 +489,8 @@ class SquidAsAServiceCharm(ops.CharmBase):
         content = textwrap.dedent(f"""\
             DATABASE_URL={db_url}
             SECRET_KEY={secret_key}
+            METRICS_USERNAME={metrics_credentials["username"]}
+            METRICS_PASSWORD={metrics_credentials["password"]}
             ALLOWED_HOSTS=*
             DJANGO_SETTINGS_MODULE=terrasquid.settings
             DJANGO_ADMIN_ENABLED=true
@@ -531,6 +547,30 @@ class SquidAsAServiceCharm(ops.CharmBase):
             peer.data[self.app][DJANGO_SECRET_ID_KEY] = secret.get_info().id
         key_file.unlink(missing_ok=True)
         return key
+
+    def _get_or_generate_metrics_credentials(self) -> dict[str, str] | None:
+        """Retrieve the application-owned metrics credentials shared by all units."""
+        peer = self.model.get_relation("squid-aaas-peers")
+        secret_id = peer.data[self.app].get(METRICS_SECRET_ID_KEY) if peer else None
+        try:
+            secret = (
+                self.model.get_secret(id=secret_id) if secret_id else self.model.get_secret(label=METRICS_SECRET_LABEL)
+            )
+        except ops.SecretNotFoundError:
+            if secret_id:
+                raise
+            if not self.unit.is_leader():
+                self.unit.status = ops.WaitingStatus(SECRET_WAIT_MESSAGE)
+                return None
+            secret = self.app.add_secret(
+                {"username": "metrics", "password": secrets.token_urlsafe(32)}, label=METRICS_SECRET_LABEL
+            )
+        credentials = secret.get_content()
+        if not credentials["username"] or not credentials["password"]:
+            raise ValueError("Metrics secret contains empty credentials")
+        if peer and self.unit.is_leader():
+            peer.data[self.app][METRICS_SECRET_ID_KEY] = secret.get_info().id
+        return {"username": credentials["username"], "password": credentials["password"]}
 
     def _django_env(self) -> dict:
         """Return a dict with PYTHONPATH and other Django env variables set."""
@@ -741,9 +781,18 @@ class SquidAsAServiceCharm(ops.CharmBase):
 
     def _cos_agent_scrape_configs(self) -> list[dict]:
         """Build local scrape jobs matching the API listener's TLS configuration."""
+        exporter_job = {
+            "metrics_path": "/metrics",
+            "static_configs": [{"targets": [f"localhost:{SQUID_EXPORTER_PORT}"]}],
+        }
+        credentials = self._get_or_generate_metrics_credentials()
+        if credentials is None:
+            logger.info("Waiting for shared metrics credentials before publishing the API scrape job")
+            return [exporter_job]
         api_job = {
             "metrics_path": "/metrics",
             "static_configs": [{"targets": [f"localhost:{int(self.config.get('api-port', 8080))}"]}],
+            "basic_auth": credentials,
         }
         if CERT_FILE.exists() and KEY_FILE.exists():
             tls_config = {}
@@ -753,13 +802,7 @@ class SquidAsAServiceCharm(ops.CharmBase):
                 tls_config["ca"] = CA_FILE.read_text()
             api_job.update(scheme="https", tls_config=tls_config)
 
-        return [
-            api_job,
-            {
-                "metrics_path": "/metrics",
-                "static_configs": [{"targets": [f"localhost:{SQUID_EXPORTER_PORT}"]}],
-            },
-        ]
+        return [api_job, exporter_job]
 
     def _unit_ipv4_address(self, relation_name: str) -> str | None:
         """Return the unit's IPv4 bind address for the given ingress relation.

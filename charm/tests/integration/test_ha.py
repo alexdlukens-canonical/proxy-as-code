@@ -139,6 +139,21 @@ def _read_squid_conf(model: str, unit: str) -> str:
     return _juju_exec(model, unit, f"cat {_SQUID_CONF}")
 
 
+def test_metrics_credentials_are_shared_across_units(juju_ha, ha_deployment, metrics_auth):
+    """Every HA unit must accept the same credentials and reject anonymous scrapes."""
+    app = ha_deployment["saas_app"]
+    auth = metrics_auth(juju_ha, f"{app}/0")
+    for index in range(_NUM_UNITS):
+        assert metrics_auth(juju_ha, f"{app}/{index}") == auth
+        address = _unit_address(juju_ha, app, index)
+        host = f"[{address}]" if ":" in address else address
+        url = f"http://{host}:{_API_PORT}/metrics"
+        assert requests.get(url, timeout=10).status_code == 401
+        response = requests.get(url, auth=auth, timeout=10)
+        assert response.status_code == 200
+        assert "terrasquid_squid_config_applied_version" in response.text
+
+
 def _policy_probe(model: str, app: str, code: str) -> dict:
     """Run a database assertion probe using the deployed application's environment."""
     charm_dir = f"/var/lib/juju/agents/unit-{app}-0/charm"
