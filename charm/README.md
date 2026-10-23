@@ -46,6 +46,20 @@ Followers wait for the shared key before configuring the workload. Previously,
 each unit had its own key; adopting the leader's key can invalidate sessions
 signed by another unit's old key.
 
+The `/metrics` endpoint requires HTTP Basic authentication, including for
+localhost requests. The leader creates the application-owned Juju secret
+`terrasquid-metrics` containing `username` and `password`. Its ID is published
+on the peer relation so every HA and replacement unit uses the same credentials;
+followers wait for the secret before configuring the workload. Credentials are
+preserved across upgrades and leadership changes.
+
+The charm publishes these credentials as `basic_auth` in the Django scrape job
+on each unit's `cos-agent` relation. The COS consumer therefore receives the
+plaintext credentials in relation data, while peer data contains only the secret
+ID. The Squid exporter remains loopback-only and does not use these credentials.
+Use HTTPS for remote authenticated scrapes: Basic authentication does not encrypt
+credentials, and the API listener uses HTTP unless certificates are configured.
+
 Database credentials remain managed by the PostgreSQL relation. TLS private keys
 are already stored in Juju secrets by the certificates library and can be
 reissued for replacement units. API keys and superuser passwords are stored as
@@ -54,8 +68,9 @@ key or rotate it if lost. Protect and back up both the Juju controller's secret
 storage and PostgreSQL: application secrets survive unit replacement, not
 application removal or loss of the controller's secret store.
 
-The workload still needs a local environment file containing the Django key and
-database URL. The charm creates it with restricted permissions (0640).
+The workload still needs a local environment file containing metrics credentials,
+the Django key, and database URL. The charm creates it with restricted permissions
+(0640).
 
 ## Unit tests
 

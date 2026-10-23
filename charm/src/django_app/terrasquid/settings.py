@@ -33,7 +33,7 @@ INSTALLED_APPS = [
 ]
 
 MIDDLEWARE = [
-    "terrasquid.middleware.LocalhostMetricsMiddleware",
+    "terrasquid.middleware.MetricsAuthenticationMiddleware",
     "django_prometheus.middleware.PrometheusBeforeMiddleware",
     "django.middleware.security.SecurityMiddleware",
     "whitenoise.middleware.WhiteNoiseMiddleware",
@@ -126,6 +126,8 @@ SPECTACULAR_SETTINGS = {
 }
 
 JUJU_UNIT_NAME = os.environ.get("JUJU_UNIT_NAME", "squid-as-a-service/0")
+METRICS_USERNAME = os.environ.get("METRICS_USERNAME", "")
+METRICS_PASSWORD = os.environ.get("METRICS_PASSWORD", "")
 
 TERRASQUID_STATUS_FILE = os.environ.get(
     "TERRASQUID_STATUS_FILE",

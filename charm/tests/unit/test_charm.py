@@ -43,6 +43,15 @@ def base_state():
     )
 
 
+@pytest.fixture()
+def metrics_credentials(monkeypatch):
+    """Isolate existing lifecycle tests from metrics secret provisioning."""
+    monkeypatch.setattr(
+        "charm.SquidAsAServiceCharm._get_or_generate_metrics_credentials",
+        lambda _self: {"username": "metrics", "password": "test-password"},
+    )
+
+
 class TestInstall:
     """Tests for the install event."""
 
@@ -184,6 +193,7 @@ class TestWatcherTimer:
         assert f"OnUnitActiveSec={expected}" in write_text.call_args.args[0]
 
 
+@pytest.mark.usefixtures("metrics_credentials")
 class TestUpgrade:
     """Tests for charm upgrades."""
 
@@ -324,6 +334,7 @@ class TestCollectUnitStatus:
         assert state.unit_status == ops.MaintenanceStatus("Starting API service")
 
 
+@pytest.mark.usefixtures("metrics_credentials")
 class TestCOSAgentRelation:
     """Tests for COS agent telemetry publication."""
 
@@ -411,6 +422,7 @@ class TestCOSAgentRelation:
         jobs = {job["static_configs"][0]["targets"][0]: job for job in data["metrics_scrape_jobs"]}
         api_job = jobs[f"localhost:{port}"]
         assert api_job["metrics_path"] == "/metrics"
+        assert api_job["basic_auth"] == {"username": "metrics", "password": "test-password"}
         if has_cert and has_key:
             assert api_job["scheme"] == "https"
             expected_tls = {}
@@ -424,6 +436,7 @@ class TestCOSAgentRelation:
             assert "tls_config" not in api_job
         assert "scheme" not in jobs["localhost:9301"]
         assert "tls_config" not in jobs["localhost:9301"]
+        assert "basic_auth" not in jobs["localhost:9301"]
 
     def test_relation_advertises_metrics_dashboard_and_alert_rules(self, ctx, base_state):
         """COS relation data must advertise the local metrics scrape target and bundled artifacts."""
@@ -557,6 +570,124 @@ class TestActions:
         assert ctx.action_results == {"result": "Superuser 'admin' created.", "password": "generated-password"}
 
 
+class TestMetricsCredentials:
+    """Tests for durable metrics credentials and HA propagation."""
+
+    @pytest.fixture(autouse=True)
+    def local_paths(self, ctx, tmp_path, monkeypatch):
+        """Keep rendered credentials and legacy key checks inside the test directory."""
+        monkeypatch.setattr("charm.TERRASQUID_RUN_DIR", tmp_path)
+        monkeypatch.setattr("charm.TERRASQUID_ENV_FILE", tmp_path / "terrasquid.env")
+
+    def test_leader_creates_and_reuses_application_secret(self, ctx):
+        """Repeated leadership events must not rotate the shared metrics credentials."""
+        peer = ops.testing.PeerRelation("squid-aaas-peers")
+        with patch("charm.secrets.token_urlsafe", return_value="generated-password") as generate:
+            state = ctx.run(ctx.on.leader_elected(), ops.testing.State(leader=True, relations={peer}))
+            state = ctx.run(ctx.on.leader_elected(), state)
+        secret = next(secret for secret in state.secrets if secret.label == "terrasquid-metrics")
+        assert secret.owner == "app"
+        assert secret.tracked_content == {"username": "metrics", "password": "generated-password"}
+        assert state.get_relation(peer.id).local_app_data["metrics-secret-id"] == secret.id
+        assert "generated-password" not in json.dumps(state.get_relation(peer.id).local_app_data)
+        generate.assert_called_once_with(32)
+
+    def test_new_leader_publishes_existing_secret(self, ctx):
+        """An existing app secret must survive leadership changes and late peer creation."""
+        secret = ops.testing.Secret(
+            {"username": "metrics", "password": "persisted-password"}, owner="app", label="terrasquid-metrics"
+        )
+        peer = ops.testing.PeerRelation("squid-aaas-peers", peers_data={1: {}})
+        with patch("charm.secrets.token_urlsafe") as generate:
+            state = ctx.run(
+                ctx.on.relation_joined(peer, remote_unit=1),
+                ops.testing.State(leader=True, secrets={secret}, relations={peer}),
+            )
+        assert state.get_relation(peer.id).local_app_data["metrics-secret-id"] == secret.id
+        assert state.get_secret(id=secret.id).tracked_content == secret.tracked_content
+        generate.assert_not_called()
+
+    def test_peer_update_configures_follower_and_cos(self, ctx, tmp_path, no_subprocess):
+        """Followers must use the leader's exact credentials in both Gunicorn and COS."""
+        django_secret = ops.testing.Secret({"secret-key": "shared-key"}, owner="app", label="terrasquid-django")
+        metrics_secret = ops.testing.Secret(
+            {"username": "metrics", "password": "shared-password"}, owner="app", label="terrasquid-metrics"
+        )
+        peer = ops.testing.PeerRelation(
+            "squid-aaas-peers",
+            local_app_data={"django-secret-id": django_secret.id, "metrics-secret-id": metrics_secret.id},
+            peers_data={1: {}},
+        )
+        cos = ops.testing.Relation("cos-agent", remote_app_name="grafana-agent")
+        (tmp_path / "terrasquid.env").write_text("SECRET_KEY=shared-key\n")
+        with (
+            patch("charm.SquidAsAServiceCharm._database_url", return_value="postgresql://host/db"),
+            patch("charm.SquidAsAServiceCharm._gunicorn_running", return_value=True),
+            patch("charm.secrets.token_urlsafe") as generate,
+        ):
+            state = ctx.run(
+                ctx.on.relation_changed(peer, remote_unit=1),
+                ops.testing.State(secrets={django_secret, metrics_secret}, relations={peer, cos}),
+            )
+        content = (tmp_path / "terrasquid.env").read_text()
+        assert "METRICS_USERNAME=metrics\n" in content
+        assert "METRICS_PASSWORD=shared-password\n" in content
+        assert (tmp_path / "terrasquid.env").stat().st_mode & 0o777 == 0o640
+        jobs = json.loads(state.get_relation(cos.id).local_unit_data["config"])["metrics_scrape_jobs"]
+        api_job = next(job for job in jobs if job["static_configs"][0]["targets"] == ["localhost:8080"])
+        assert api_job["basic_auth"] == metrics_secret.tracked_content
+        no_subprocess.assert_any_call(["systemctl", "restart", "terrasquid-api"], check=True)
+        generate.assert_not_called()
+
+    def test_follower_waits_for_metrics_secret(self, ctx, tmp_path):
+        """A follower with only the Django key must defer without generating credentials."""
+        secret = ops.testing.Secret({"secret-key": "shared-key"}, owner="app", label="terrasquid-django")
+        peer = ops.testing.PeerRelation("squid-aaas-peers", local_app_data={"django-secret-id": secret.id})
+        with (
+            patch("charm.SquidAsAServiceCharm._database_url", return_value="postgresql://host/db"),
+            patch("charm.secrets.token_urlsafe") as generate,
+        ):
+            state = ctx.run(ctx.on.start(), ops.testing.State(secrets={secret}, relations={peer}))
+        assert state.deferred
+        assert state.unit_status == ops.WaitingStatus("Waiting for leader to create application secret")
+        assert not (tmp_path / "terrasquid.env").exists()
+        generate.assert_not_called()
+
+    def test_follower_omits_api_job_until_credentials_arrive(self, ctx):
+        """COS must not receive an unauthenticated API job while a follower waits."""
+        cos = ops.testing.Relation("cos-agent", remote_app_name="grafana-agent")
+        state = ctx.run(ctx.on.relation_joined(cos), ops.testing.State(relations={cos}))
+        jobs = json.loads(state.get_relation(cos.id).local_unit_data["config"])["metrics_scrape_jobs"]
+        assert len(jobs) == 1
+        assert jobs[0]["static_configs"][0]["targets"] == ["localhost:9301"]
+
+    def test_missing_published_secret_is_not_regenerated(self, ctx):
+        """A broken secret reference must fail visibly rather than rotate passwords."""
+        peer = ops.testing.PeerRelation("squid-aaas-peers", local_app_data={"metrics-secret-id": "secret:missing"})
+        with (
+            ctx(ctx.on.config_changed(), ops.testing.State(leader=True, relations={peer})) as mgr,
+            pytest.raises(ops.SecretNotFoundError),
+        ):
+            mgr.charm._get_or_generate_metrics_credentials()
+
+    def test_upgrade_installs_authentication_without_rotating_django_key(self, ctx, tmp_path, no_subprocess):
+        """Existing deployments must gain credentials and restart with the new environment."""
+        secret = ops.testing.Secret({"secret-key": "existing-key"}, owner="app", label="terrasquid-django")
+        peer = ops.testing.PeerRelation("squid-aaas-peers", local_app_data={"django-secret-id": secret.id})
+        with (
+            patch("charm.SquidAsAServiceCharm._database_url", return_value="postgresql://host/db"),
+            patch("charm.SquidAsAServiceCharm._write_systemd_units"),
+            patch("charm.SquidAsAServiceCharm._run_manage"),
+        ):
+            state = ctx.run(ctx.on.upgrade_charm(), ops.testing.State(leader=True, secrets={secret}, relations={peer}))
+        metrics = next(secret for secret in state.secrets if secret.label == "terrasquid-metrics")
+        assert "SECRET_KEY=existing-key\n" in (tmp_path / "terrasquid.env").read_text()
+        assert f"METRICS_PASSWORD={metrics.tracked_content['password']}\n" in (tmp_path / "terrasquid.env").read_text()
+        assert state.get_relation(peer.id).local_app_data["metrics-secret-id"] == metrics.id
+        no_subprocess.assert_any_call(["systemctl", "restart", "terrasquid-api"], check=True)
+
+
+@pytest.mark.usefixtures("metrics_credentials")
 class TestSecretKey:
     """Tests for durable application keys and upgrades from unit-local keys."""
 
@@ -711,6 +842,7 @@ class TestSecretKey:
         no_subprocess.assert_any_call(["systemctl", "restart", "terrasquid-api"], check=True)
 
 
+@pytest.mark.usefixtures("metrics_credentials")
 class TestEnvFile:
     """Tests for environment file generation."""
 
@@ -758,6 +890,8 @@ class TestEnvFile:
                 mgr.run()
             content = (tmp_path / "terrasquid.env").read_text()
             assert "SQUID_PINNED_CONFIG_VERSION=5" in content
+            assert "METRICS_USERNAME=metrics\n" in content
+            assert "METRICS_PASSWORD=test-password\n" in content
         finally:
             charm_module.TERRASQUID_ENV_FILE = orig_env
             charm_module.GUNICORN_CONF_FILE = orig_gunicorn
@@ -929,6 +1063,7 @@ class TestGunicornConfig:
         assert "keyfile" not in content
 
 
+@pytest.mark.usefixtures("metrics_credentials")
 class TestWorkloadObservability:
     """Tests for scrapeable logs and optional workload tracing."""
 

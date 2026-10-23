@@ -1,7 +1,9 @@
 """Pytest fixtures for Terrasquid integration tests."""
 
+import json
 import os
 import secrets
+import subprocess
 from pathlib import Path
 
 import jubilant
@@ -9,6 +11,29 @@ import pytest
 
 CHARM_DIR = Path(__file__).parent.parent.parent
 JUJU_BIN = "/snap/juju/current/bin/juju"
+
+
+@pytest.fixture()
+def metrics_auth():
+    """Read a unit's rendered metrics credentials without placing them in command arguments."""
+
+    def read_credentials(juju: jubilant.Juju, unit: str) -> tuple[str, str]:
+        code = (
+            "import json; from pathlib import Path; "
+            "env = dict(line.split('=', 1) for line in "
+            "Path('/etc/terrasquid/terrasquid.env').read_text().splitlines()); "
+            "print(json.dumps([env['METRICS_USERNAME'], env['METRICS_PASSWORD']]))"
+        )
+        result = subprocess.run(
+            [JUJU_BIN, "exec", "--model", juju.model, "--unit", unit, "--", "python3", "-c", code],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        username, password = json.loads(result.stdout)
+        return username, password
+
+    return read_credentials
 
 
 @pytest.fixture(scope="module")
