@@ -5,7 +5,7 @@ from pathlib import Path
 from unittest.mock import MagicMock
 
 import pytest
-from terrasquid.api.squid_render import validate_squid_config
+from terrasquid.api.squid_render import render_squid_config, validate_squid_config
 
 import squid
 
@@ -106,6 +106,23 @@ def test_validation_parses_temporary_config_and_cleans_it_up(squid_binary, run_p
     assert validate_squid_config(config) == (True, "")
     temporary_config = Path(run_process.call_args.args[0][4])
     assert not temporary_config.parent.exists()
+
+
+@pytest.mark.django_db
+def test_validation_parses_default_config_with_caching_disabled(squid_binary, run_process):
+    """The generated no-cache policy reaches Squid's parser intact."""
+    config = render_squid_config()
+
+    def parse_config(command, **kwargs):
+        assert command[:4] == [str(squid_binary), "-k", "parse", "-f"]
+        assert Path(command[4]).read_text() == config
+        assert kwargs == {"capture_output": True, "text": True, "timeout": 10}
+        assert config.splitlines().count("cache deny all") == 1
+        return subprocess.CompletedProcess(command, 0, "", "")
+
+    run_process.side_effect = parse_config
+
+    assert validate_squid_config(config) == (True, "")
 
 
 @pytest.mark.parametrize(

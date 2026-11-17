@@ -67,6 +67,7 @@ class ServiceModelViewSet(viewsets.ModelViewSet):
 
     permission_classes = [ServiceAPIKeyPermission]
     serializer_class = None  # Must be set by subclasses
+    unordered_fields = {"cidr", "ports", "port_ranges"}
 
     def get_queryset(self):
         """Return only resources belonging to the authenticated service."""
@@ -88,15 +89,54 @@ class ServiceModelViewSet(viewsets.ModelViewSet):
 
     @ConfigVersion.locked()
     def create(self, request: Request, *args, **kwargs) -> Response:
-        """Create or return existing resource (idempotent by (service, name))."""
-        name = request.data.get("name")
-        existing = self.queryset.filter(service=request.api_key.name, name=name).first() if name else None
-        if existing:
-            return Response(self.get_serializer(existing).data, status=status.HTTP_200_OK)
+        """Create a resource or return an identical existing resource."""
         serializer = self.get_serializer(data=request.data)
         serializer.is_valid(raise_exception=True)
+        name = serializer.validated_data.get("name")
+        existing = self.queryset.filter(service=request.api_key.name, name=name).first() if name else None
+        if existing:
+            return self._duplicate_response(existing, serializer)
         self.perform_create_with_squid_validation(serializer)
         return Response(serializer.data, status=status.HTTP_201_CREATED)
+
+    def _duplicate_response(self, instance, serializer) -> Response:
+        """Return an existing resource only when its writable attributes match."""
+        conflicts = self._duplicate_conflicts(instance, serializer)
+        if conflicts:
+            return Response(
+                {
+                    "detail": "A resource with this name already exists with different attributes.",
+                    "conflicting_fields": conflicts,
+                },
+                status=status.HTTP_409_CONFLICT,
+            )
+        return Response(self.get_serializer(instance).data, status=status.HTTP_200_OK)
+
+    def _duplicate_conflicts(self, instance, serializer) -> list[str]:
+        """Return writable fields whose requested values differ from an instance."""
+        conflicts = []
+        for field_name, field in serializer.fields.items():
+            if field.read_only:
+                continue
+            model_field = instance._meta.get_field(field_name)
+            if model_field.many_to_many:
+                current = set(getattr(instance, field_name).all())
+                requested = set(serializer.validated_data.get(field_name, []))
+            elif field_name in serializer.validated_data:
+                current = getattr(instance, field_name)
+                requested = serializer.validated_data[field_name]
+            elif model_field.has_default():
+                current = getattr(instance, field_name)
+                requested = model_field.get_default()
+            else:
+                continue
+
+            if field_name in self.unordered_fields:
+                current = set(current or [])
+                requested = set(requested or [])
+            if current != requested:
+                conflicts.append(field_name)
+        return conflicts
 
     def perform_create_with_squid_validation(self, serializer) -> None:
         """Save the model and validate Squid config, rolling back on failure."""
@@ -201,16 +241,18 @@ class DestinationGroupViewSet(ServiceModelViewSet):
 
     @ConfigVersion.locked()
     def create(self, request: Request, *args, **kwargs) -> Response:
-        """Create a group or return the owner's existing group with the same name."""
+        """Create a group unless another service already owns its global name."""
         name = request.data.get("name")
         existing = self.queryset.filter(name=name).first() if name else None
-        if existing:
-            if existing.service == request.api_key.name:
-                return Response(self.get_serializer(existing).data, status=status.HTTP_200_OK)
+        if existing and existing.service != request.api_key.name:
             return Response(
                 {"detail": "A destination group with this name already exists."},
                 status=status.HTTP_409_CONFLICT,
             )
+        if existing:
+            serializer = self.get_serializer(existing, data=request.data)
+            serializer.is_valid(raise_exception=True)
+            return self._duplicate_response(existing, serializer)
         return super().create(request, *args, **kwargs)
 
     @ConfigVersion.locked()

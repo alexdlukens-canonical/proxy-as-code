@@ -14,6 +14,15 @@ from terrasquid.api.squid_render import (
 from terrasquid.api.validators import validate_port_ranges, validate_ports
 
 
+@pytest.mark.django_db
+def test_default_render_disables_caching():
+    """The managed forward proxy never stores cacheable responses."""
+    config = render_squid_config()
+
+    assert config.splitlines().count("cache deny all") == 1
+    assert config.index("cache deny all") < config.index("# ======= Source ACLs =======")
+
+
 @pytest.mark.parametrize("action,default", [("ALLOW", 80), ("DENY", 80), ("CONNECT", 443)])
 @pytest.mark.parametrize("ports,ranges", [(None, None), ([], []), ([443, 80, 443], None), ([], ["30000-32767"])])
 def test_effective_ports(action, default, ports, ranges):

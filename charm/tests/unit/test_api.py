@@ -95,7 +95,31 @@ class TestSourceACLEndpoints(TestCase):
         assert "comment" in response.json()
 
     def test_create_idempotent_returns_200(self) -> None:
-        """Duplicate POST with same (service, name) returns 200 with existing resource."""
+        """Equivalent duplicate POSTs return 200 regardless of CIDR order or omitted defaults."""
+        with (
+            patch("terrasquid.api.squid_render.validate_squid_config", return_value=(True, "")),
+            patch("terrasquid.api.squid_render.render_squid_config", return_value="# config"),
+        ):
+            self.client.post(
+                "/api/v1/sources/",
+                {"name": "corp-vpn", "cidr": ["10.0.0.0/8", "192.168.0.0/16"]},
+                format="json",
+            )
+            response = self.client.post(
+                "/api/v1/sources/",
+                {
+                    "name": "corp-vpn",
+                    "cidr": ["192.168.0.0/16", "10.0.0.0/8"],
+                    "comment": "",
+                },
+                format="json",
+            )
+        assert response.status_code == 200
+
+    def test_create_conflicting_duplicate_returns_409(self) -> None:
+        """A same-name source with different writable attributes is not updated."""
+        from terrasquid.api.models import SourceACL
+
         with (
             patch("terrasquid.api.squid_render.validate_squid_config", return_value=(True, "")),
             patch("terrasquid.api.squid_render.render_squid_config", return_value="# config"),
@@ -107,10 +131,15 @@ class TestSourceACLEndpoints(TestCase):
             )
             response = self.client.post(
                 "/api/v1/sources/",
-                {"name": "corp-vpn", "cidr": ["10.0.0.0/8"]},
+                {"name": "corp-vpn", "cidr": ["172.16.0.0/12"], "comment": "changed"},
                 format="json",
             )
-        assert response.status_code == 200
+
+        assert response.status_code == 409
+        assert set(response.json()["conflicting_fields"]) == {"cidr", "comment"}
+        source = SourceACL.objects.get(service="test-service", name="corp-vpn")
+        assert source.cidr == ["10.0.0.0/8"]
+        assert source.comment == ""
 
     def test_unauthenticated_post_returns_403(self) -> None:
         """Unauthenticated POST must be rejected with 403."""
@@ -214,6 +243,63 @@ class TestDestinationConfigEndpoints(TestCase):
         assert data["type"] == "ALLOW"
         assert data["comment"] == "Ubuntu package mirror"
         assert data["port_ranges"] is None
+
+    def test_create_equivalent_duplicate_returns_200(self) -> None:
+        """Equivalent destination duplicates ignore collection order and use API defaults."""
+        with (
+            patch("terrasquid.api.squid_render.validate_squid_config", return_value=(True, "")),
+            patch("terrasquid.api.squid_render.render_squid_config", return_value="# config"),
+        ):
+            self.client.post(
+                "/api/v1/destinations/",
+                {
+                    "name": "ubuntu-archive",
+                    "dst": "archive.ubuntu.com",
+                    "type": "ALLOW",
+                    "ports": [443, 80],
+                    "port_ranges": ["30000-32767", "10000-20000"],
+                },
+                format="json",
+            )
+            response = self.client.post(
+                "/api/v1/destinations/",
+                {
+                    "name": "ubuntu-archive",
+                    "dst": "archive.ubuntu.com",
+                    "type": "ALLOW",
+                    "ports": [80, 443],
+                    "port_ranges": ["10000-20000", "30000-32767"],
+                    "comment": "",
+                },
+                format="json",
+            )
+
+        assert response.status_code == 200
+
+    def test_create_conflicting_duplicate_returns_409(self) -> None:
+        """A same-name destination with different attributes is not updated."""
+        from terrasquid.api.models import DestinationConfig
+
+        with (
+            patch("terrasquid.api.squid_render.validate_squid_config", return_value=(True, "")),
+            patch("terrasquid.api.squid_render.render_squid_config", return_value="# config"),
+        ):
+            self.client.post(
+                "/api/v1/destinations/",
+                {"name": "ubuntu-archive", "dst": "archive.ubuntu.com", "type": "ALLOW"},
+                format="json",
+            )
+            response = self.client.post(
+                "/api/v1/destinations/",
+                {"name": "ubuntu-archive", "dst": "example.com", "type": "CONNECT"},
+                format="json",
+            )
+
+        assert response.status_code == 409
+        assert set(response.json()["conflicting_fields"]) == {"dst", "type"}
+        destination = DestinationConfig.objects.get(service="test-service", name="ubuntu-archive")
+        assert destination.dst == "archive.ubuntu.com"
+        assert destination.type == "ALLOW"
 
     def test_port_ranges_crud(self) -> None:
         """Ranges round-trip alongside ports and can be replaced, cleared, or unset."""
@@ -440,6 +526,70 @@ class TestDestinationGroupEndpoints(TestCase):
             )
         assert response.status_code == 409
 
+    def test_create_equivalent_duplicate_returns_200(self) -> None:
+        """An owner can retry a group with equivalent destinations in a different order."""
+        from terrasquid.api.models import DestinationConfig
+
+        second = DestinationConfig.objects.create(
+            service="test-service",
+            name="gitlab",
+            key_prefix="ab12cd34",
+            dst="gitlab.com",
+            type="CONNECT",
+        )
+        destinations = [str(self.destination.id), str(second.id)]
+        with (
+            patch("terrasquid.api.squid_render.validate_squid_config", return_value=(True, "")),
+            patch("terrasquid.api.squid_render.render_squid_config", return_value="# config"),
+        ):
+            self.client.post(
+                "/api/v1/destination-groups/",
+                {"name": "common-sites-cloud-access", "destinations": destinations},
+                format="json",
+            )
+            response = self.client.post(
+                "/api/v1/destination-groups/",
+                {
+                    "name": "common-sites-cloud-access",
+                    "destinations": list(reversed(destinations)),
+                    "comment": "",
+                },
+                format="json",
+            )
+
+        assert response.status_code == 200
+
+    def test_create_conflicting_duplicate_returns_409(self) -> None:
+        """An owner cannot silently replace a same-name group's destinations."""
+        from terrasquid.api.models import DestinationConfig, DestinationGroup
+
+        replacement = DestinationConfig.objects.create(
+            service="test-service",
+            name="gitlab",
+            key_prefix="ab12cd34",
+            dst="gitlab.com",
+            type="CONNECT",
+        )
+        with (
+            patch("terrasquid.api.squid_render.validate_squid_config", return_value=(True, "")),
+            patch("terrasquid.api.squid_render.render_squid_config", return_value="# config"),
+        ):
+            self.client.post(
+                "/api/v1/destination-groups/",
+                {"name": "common-sites-cloud-access", "destinations": [str(self.destination.id)]},
+                format="json",
+            )
+            response = self.client.post(
+                "/api/v1/destination-groups/",
+                {"name": "common-sites-cloud-access", "destinations": [str(replacement.id)]},
+                format="json",
+            )
+
+        assert response.status_code == 409
+        assert response.json()["conflicting_fields"] == ["destinations"]
+        group = DestinationGroup.objects.get(name="common-sites-cloud-access")
+        assert list(group.destinations.all()) == [self.destination]
+
 
 class TestACLRuleEndpoints(TestCase):
     """Tests for /api/v1/acl-rules/ CRUD."""
@@ -487,6 +637,86 @@ class TestACLRuleEndpoints(TestCase):
         assert data["sources"] == [str(self.src.id)]
         assert data["destinations"] == [str(self.dst.id)]
         assert data["comment"] == "Permit corporate users"
+
+    def test_create_equivalent_duplicate_returns_200(self) -> None:
+        """Equivalent ACL retries ignore relation order and apply omitted defaults."""
+        from terrasquid.api.models import DestinationConfig, SourceACL
+
+        second_src = SourceACL.objects.create(
+            service="test-service",
+            name="second-src",
+            key_prefix="ab12cd34",
+            cidr=["192.168.0.0/16"],
+        )
+        second_dst = DestinationConfig.objects.create(
+            service="test-service",
+            name="second-dst",
+            key_prefix="ab12cd34",
+            dst="second.example.com",
+            type="ALLOW",
+        )
+        sources = [str(self.src.id), str(second_src.id)]
+        destinations = [str(self.dst.id), str(second_dst.id)]
+        with (
+            patch("terrasquid.api.squid_render.validate_squid_config", return_value=(True, "")),
+            patch("terrasquid.api.squid_render.render_squid_config", return_value="# config"),
+        ):
+            self.client.post(
+                "/api/v1/acl-rules/",
+                {
+                    "name": "allow-corp-to-ubuntu",
+                    "sources": sources,
+                    "destinations": destinations,
+                },
+                format="json",
+            )
+            response = self.client.post(
+                "/api/v1/acl-rules/",
+                {
+                    "name": "allow-corp-to-ubuntu",
+                    "priority": 100,
+                    "sources": list(reversed(sources)),
+                    "destinations": list(reversed(destinations)),
+                    "destination_groups": [],
+                    "comment": "",
+                },
+                format="json",
+            )
+
+        assert response.status_code == 200
+
+    def test_create_conflicting_duplicate_returns_409(self) -> None:
+        """A same-name ACL rule with different writable attributes is not updated."""
+        from terrasquid.api.models import ACLRule
+
+        with (
+            patch("terrasquid.api.squid_render.validate_squid_config", return_value=(True, "")),
+            patch("terrasquid.api.squid_render.render_squid_config", return_value="# config"),
+        ):
+            self.client.post(
+                "/api/v1/acl-rules/",
+                {
+                    "name": "allow-corp-to-ubuntu",
+                    "sources": [str(self.src.id)],
+                    "destinations": [str(self.dst.id)],
+                },
+                format="json",
+            )
+            response = self.client.post(
+                "/api/v1/acl-rules/",
+                {
+                    "name": "allow-corp-to-ubuntu",
+                    "priority": 50,
+                    "sources": [str(self.src.id)],
+                    "destinations": [str(self.dst.id)],
+                },
+                format="json",
+            )
+
+        assert response.status_code == 409
+        assert response.json()["conflicting_fields"] == ["priority"]
+        rule = ACLRule.objects.get(service="test-service", name="allow-corp-to-ubuntu")
+        assert rule.priority == 100
 
     def test_acl_rule_requires_at_least_one_source(self) -> None:
         """ACL rule with an empty sources list returns 400."""
