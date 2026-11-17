@@ -57,6 +57,8 @@ class SourceACL(BaseResource):
 class DestinationConfig(BaseResource):
     """A destination rule specifying a host/CIDR and the action to apply."""
 
+    name = models.CharField(max_length=255)
+
     class ActionType(models.TextChoices):
         ALLOW = "ALLOW", "Allow"
         DENY = "DENY", "Deny"

@@ -7,6 +7,7 @@ These tests deploy a real Juju model with PostgreSQL and verify that:
 - Basic CRUD on SourceACL resources works through the live API.
 """
 
+import hashlib
 import subprocess
 import time
 
@@ -453,8 +454,10 @@ def test_proxy_acl_rule_allows_traffic(juju, deployed_charms):
 
     squid_conf = _read_squid_conf(juju, deployed_charms["saas_app"])
     source_acl = f"acl src__{source['key_prefix']}__{source['name']}"
-    destination_acl = f"acl dst__{destination['key_prefix']}__{destination['name']}"
-    rule_destination_acl = f"dst__{destination['key_prefix']}__{destination['name']}"
+    destination_hash = hashlib.md5(destination["name"].encode("utf-8"), usedforsecurity=False).hexdigest()
+    destination_acl_name = f"dst__{destination['key_prefix']}__{destination_hash}"
+    destination_acl = f"acl {destination_acl_name}"
+    rule_destination_acl = destination_acl_name
     rule_port_acl = "port__80"
     access_rule = (
         f"http_access allow src__{source['key_prefix']}__{source['name']} {rule_destination_acl} {rule_port_acl}"

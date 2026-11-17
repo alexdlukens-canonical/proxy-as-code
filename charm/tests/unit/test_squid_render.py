@@ -1,5 +1,7 @@
 """Tests for byte-bounded Squid ACL rendering."""
 
+import hashlib
+
 import pytest
 from django.core.exceptions import ValidationError
 from django.db import connection
@@ -8,6 +10,7 @@ from terrasquid.api.models import ACLRule, DestinationConfig, DestinationGroup, 
 from terrasquid.api.squid_render import (
     MAX_ACL_LINE_BYTES,
     _any_of_lines,
+    _destination_acl_name,
     _destination_group_acl_name,
     render_squid_config,
 )
@@ -189,7 +192,7 @@ def test_render_places_rule_comments_next_to_access_lines(grouped, comment):
                 rule.destination_groups.get(), {"ALLOW": 1, "CONNECT": 2, "DENY": 3}[action]
             )
         else:
-            destination_name = f"dst__ab12cd34__{rule.name}-{action.lower()}"
+            destination_name = _destination_acl_name(rule.destinations.get(type=action))
         method = " CONNECT" if action == "CONNECT" else ""
         expected.append(
             (
@@ -270,6 +273,42 @@ def test_render_hashes_destination_group_names(name, comment):
 
 
 @pytest.mark.django_db
+@pytest.mark.parametrize("grouped", [False, True])
+def test_render_hashes_long_destination_config_names(grouped):
+    """Destination ACL identifiers stay compact while readable names remain in comments."""
+    source = SourceACL.objects.create(service="test", key_prefix="MW9oiAim", name="source", cidr=["10.0.0.0/8"])
+    destination = DestinationConfig.objects.create(
+        service="test",
+        key_prefix="MW9oiAim",
+        name="d" * 255,
+        dst="example.com",
+        type="ALLOW",
+    )
+    destination.full_clean()
+    rule = ACLRule.objects.create(service="test", key_prefix="MW9oiAim", name="rule")
+    rule.sources.add(source)
+    if grouped:
+        group = DestinationGroup.objects.create(service="test", key_prefix="MW9oiAim", name="sites")
+        group.destinations.add(destination)
+        rule.destination_groups.add(group)
+    else:
+        rule.destinations.add(destination)
+
+    config = render_squid_config()
+    acl_name = _destination_acl_name(destination)
+    name_hash = acl_name.rsplit("__", 1)[-1]
+
+    assert acl_name == f"dst__MW9oiAim__{hashlib.md5(destination.name.encode(), usedforsecurity=False).hexdigest()}"
+    assert len(name_hash) == 32
+    assert len(acl_name.encode("utf-8")) <= 63
+    assert f"acl {acl_name} dstdomain example.com" in config
+    assert sum(acl_name in line.split() for line in config.splitlines()) == 2
+    assert destination.name not in acl_name
+    assert f"# Service: test; destination: {destination.name}\n" in config
+    assert render_squid_config() == config
+
+
+@pytest.mark.django_db
 def test_render_splits_all_any_of_groups():
     """Large source, destination, and reusable groups retain every reference."""
     sources = SourceACL.objects.bulk_create(
@@ -292,25 +331,25 @@ def test_render_splits_all_any_of_groups():
                 dst=f"site-{index}.example.com",
                 type="ALLOW",
             )
-            for index in range(240)
+            for index in range(360)
         ]
     )
     group = DestinationGroup.objects.create(service="test", key_prefix="ab12cd34", name="sites")
-    group.destinations.add(*destinations[:120])
+    group.destinations.add(*destinations[:180])
     rule = ACLRule.objects.create(service="test", key_prefix="ab12cd34", name="rule")
     rule.sources.add(*sources)
-    rule.destinations.add(*destinations[120:])
+    rule.destinations.add(*destinations[180:])
     rule.destination_groups.add(group)
 
     config = render_squid_config()
     expected_members = {
         "dst_group__ab12cd34__d27edbd18c3bdf9ce1d013c6626ba26c__1": [
-            f"dst__ab12cd34__{item.name}" for item in destinations[:120]
+            _destination_acl_name(item) for item in destinations[:180]
         ],
         "rule_src__ab12cd34__rule": [f"src__ab12cd34__{item.name}" for item in sources],
         "rule_dst__ab12cd34__rule__1": sorted(
             ["dst_group__ab12cd34__d27edbd18c3bdf9ce1d013c6626ba26c__1"]
-            + [f"dst__ab12cd34__{item.name}" for item in destinations[120:]]
+            + [_destination_acl_name(item) for item in destinations[180:]]
         ),
     }
     for acl_name, members in expected_members.items():

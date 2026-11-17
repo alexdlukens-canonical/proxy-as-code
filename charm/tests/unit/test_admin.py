@@ -8,6 +8,7 @@ from django.test import RequestFactory, TestCase, override_settings
 from django.urls import path
 from terrasquid.api.admin import RenderedConfigHistoryAdmin
 from terrasquid.api.models import ACLRule, ConfigVersion, DestinationConfig, RenderedConfigHistory, SourceACL
+from terrasquid.api.squid_render import _destination_acl_name
 
 urlpatterns = [path("admin/", admin.site.urls)]
 
@@ -156,6 +157,8 @@ class TestPolicyResourceAdmin(TestCase):
         assert list(rule.sources.all()) == [self.source]
         assert list(rule.destinations.all()) == [destination]
         config = ConfigVersion.get()
-        assert "http_access allow src__test1234__source dst__test1234__destination" in config.rendered_config
+        assert (
+            f"http_access allow src__test1234__source {_destination_acl_name(destination)}"
+        ) in config.rendered_config
         assert RenderedConfigHistory.objects.get(version=1).rendered_config == config.rendered_config
         validate.assert_called_once()

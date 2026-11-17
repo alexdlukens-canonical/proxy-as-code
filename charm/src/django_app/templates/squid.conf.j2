@@ -28,13 +28,14 @@ acl src__{{ src.key_prefix }}__{{ src.name }} src {{ src.cidr | join(' ') }}
 
 # ======= Destination ACLs =======
 {% for dst in destination_configs %}
+# Service: {{ dst.service }}; destination: {{ dst.name }}
 {% if dst.comment %}
 # {{ dst.comment }}
 {% endif %}
 {% if dst.is_cidr %}
-acl dst__{{ dst.key_prefix }}__{{ dst.name }} dst {{ dst.dst }}
+acl {{ dst | destination_acl_name }} dst {{ dst.dst }}
 {% else %}
-acl dst__{{ dst.key_prefix }}__{{ dst.name }} dstdomain {{ dst.dst }}
+acl {{ dst | destination_acl_name }} dstdomain {{ dst.dst }}
 {% endif %}
 
 {% endfor %}

@@ -51,11 +51,13 @@ def _get_jinja2_env() -> Environment:
         autoescape=False,
     )
     env.filters["any_of_lines"] = _any_of_lines
+    env.filters["destination_acl_name"] = _destination_acl_name
     return env
 
 
 def _destination_acl_name(destination) -> str:
-    return f"dst__{destination.key_prefix}__{destination.name}"
+    name_hash = hashlib.md5(destination.name.encode("utf-8"), usedforsecurity=False).hexdigest()
+    return f"dst__{destination.key_prefix}__{name_hash}"
 
 
 def _destination_group_acl_name(group, index: int) -> str:

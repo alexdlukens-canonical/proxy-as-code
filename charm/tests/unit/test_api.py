@@ -784,12 +784,15 @@ class TestACLRuleEndpoints(TestCase):
     def test_rendered_config_includes_acl_rule(self) -> None:
         """When an ACL rule is created, the rendered config must include its http_access statement."""
         from terrasquid.api.models import ConfigVersion
+        from terrasquid.api.squid_render import _destination_acl_name
 
         with (
             patch("terrasquid.api.squid_render.validate_squid_config", return_value=(True, "")),
             patch("terrasquid.api.squid_render.render_squid_config") as mock_render,
         ):
-            mock_render.return_value = "# config\nhttp_access allow src__test-service__my-src dst__test-service__my-dst"
+            mock_render.return_value = (
+                f"# config\nhttp_access allow src__ab12cd34__my-src {_destination_acl_name(self.dst)}"
+            )
             response = self.client.post(
                 "/api/v1/acl-rules/",
                 {
@@ -803,7 +806,7 @@ class TestACLRuleEndpoints(TestCase):
         config = ConfigVersion.get().rendered_config
         assert "http_access" in config
         assert "src__ab12cd34__my-src" in config
-        assert "dst__ab12cd34__my-dst" in config
+        assert _destination_acl_name(self.dst) in config
 
 
 class TestSquidConfigValidation(TestCase):
@@ -829,7 +832,7 @@ class TestSquidConfigValidation(TestCase):
     def test_render_uses_api_key_prefix_for_acl_names(self) -> None:
         """Render compact ACL identifiers independently of the API key's friendly name."""
         from terrasquid.api.models import ACLRule, DestinationConfig, SourceACL
-        from terrasquid.api.squid_render import render_squid_config
+        from terrasquid.api.squid_render import _destination_acl_name, render_squid_config
 
         source = SourceACL.objects.create(
             service="terrasquid-admin-key",
@@ -859,7 +862,7 @@ class TestSquidConfigValidation(TestCase):
         assert config.count("acl CONNECT method CONNECT") == 1
         assert (
             "http_access allow src__ab12cd34__stg-terrasquid-ps7-client "
-            "CONNECT dst__ab12cd34__stg-terrasquid-ps7-client-terraform port__443"
+            f"CONNECT {_destination_acl_name(destination)} port__443"
         ) in config
         assert "dstport__" not in config
 
@@ -920,7 +923,7 @@ class TestSquidConfigValidation(TestCase):
     def test_render_partitions_destination_groups_by_access_policy(self) -> None:
         """Only compatible destinations share a Squid ACL and access rule."""
         from terrasquid.api.models import ACLRule, DestinationConfig, DestinationGroup, SourceACL
-        from terrasquid.api.squid_render import render_squid_config
+        from terrasquid.api.squid_render import _destination_acl_name, render_squid_config
 
         source = SourceACL.objects.create(
             service="consumer-service",
@@ -980,9 +983,10 @@ class TestSquidConfigValidation(TestCase):
 
         config = render_squid_config()
 
-        assert ("any-of dst__dc34ab12__github dst__dc34ab12__google dst__dc34ab12__network") in config
-        assert "any-of dst__dc34ab12__ssh" in config
-        assert "any-of dst__dc34ab12__blocked" in config
+        acl_names = {destination.name: _destination_acl_name(destination) for destination in destinations}
+        assert f"any-of {acl_names['github']} {acl_names['google']} {acl_names['network']}" in config
+        assert f"any-of {acl_names['ssh']}" in config
+        assert f"any-of {acl_names['blocked']}" in config
         assert "acl rule_dst__ab12cd34__allow-common-sites__" not in config
         assert (
             config.count(
@@ -1073,7 +1077,7 @@ class TestSquidConfigValidation(TestCase):
     def test_render_orders_rules_by_priority_type_then_creation_time(self) -> None:
         """Order access rules by ascending priority, action type, then creation time."""
         from terrasquid.api.models import ACLRule, DestinationConfig, SourceACL
-        from terrasquid.api.squid_render import render_squid_config
+        from terrasquid.api.squid_render import _destination_acl_name, render_squid_config
 
         source = SourceACL.objects.create(
             service="test-service",
@@ -1088,6 +1092,7 @@ class TestSquidConfigValidation(TestCase):
             ("priority-100-connect", 100, "CONNECT"),
             ("priority-100-deny", 100, "DENY"),
         )
+        destination_acl_names = {}
         for name, priority, action_type in cases:
             destination = DestinationConfig.objects.create(
                 service="test-service",
@@ -1096,6 +1101,7 @@ class TestSquidConfigValidation(TestCase):
                 dst=f"{name}.example.com",
                 type=action_type,
             )
+            destination_acl_names[name] = _destination_acl_name(destination).removeprefix("dst__ab12cd34__")
             rule = ACLRule.objects.create(
                 service="test-service",
                 name=name,
@@ -1109,20 +1115,20 @@ class TestSquidConfigValidation(TestCase):
         access_lines = [line for line in config.splitlines() if line.startswith("http_access ") and "src__" in line]
 
         assert [line.split(" dst__ab12cd34__", 1)[1].split(" port__", 1)[0] for line in access_lines] == [
-            "priority-99-allow",
-            "priority-100-deny",
-            "priority-100-connect",
-            "created-first-allow",
-            "created-second-allow",
+            destination_acl_names["priority-99-allow"],
+            destination_acl_names["priority-100-deny"],
+            destination_acl_names["priority-100-connect"],
+            destination_acl_names["created-first-allow"],
+            destination_acl_names["created-second-allow"],
         ]
         connect_lines = [line for line in access_lines if " CONNECT " in line]
         assert len(connect_lines) == 1
-        assert "dst__ab12cd34__priority-100-connect" in connect_lines[0]
+        assert f"dst__ab12cd34__{destination_acl_names['priority-100-connect']}" in connect_lines[0]
 
     def test_render_places_comments_before_their_acl_blocks(self) -> None:
         """Configured comments label their source, destination, and logical rule exactly once."""
         from terrasquid.api.models import ACLRule, DestinationConfig, SourceACL
-        from terrasquid.api.squid_render import render_squid_config
+        from terrasquid.api.squid_render import _destination_acl_name, render_squid_config
 
         source = SourceACL.objects.create(
             service="test-service",
@@ -1151,7 +1157,7 @@ class TestSquidConfigValidation(TestCase):
         config = render_squid_config()
 
         assert config.index("# Source networks") < config.index("acl src__ab12cd34__commented-source")
-        assert config.index("# Allowed website") < config.index("acl dst__ab12cd34__commented-destination")
+        assert config.index("# Allowed website") < config.index(f"acl {_destination_acl_name(destination)}")
         assert config.index("# Permit source to website") < config.index(
             "http_access allow src__ab12cd34__commented-source"
         )
